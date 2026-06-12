@@ -3179,7 +3179,11 @@ func (m *chatTUI) toggleYoloMode() {
 }
 
 func (m chatTUI) modeTagText() string {
-	goalMode := strings.TrimSpace(m.ctrl.Goal()) != "" && m.ctrl.GoalStatus() == control.GoalStatusRunning
+	goalText := strings.TrimSpace(m.ctrl.Goal())
+	goalStatus := m.ctrl.GoalStatus()
+	goalMode := goalText != "" && goalStatus == control.GoalStatusRunning
+	goalPaused := goalText != "" && goalStatus == control.GoalStatusPaused
+	goalBlocked := goalText != "" && goalStatus == control.GoalStatusBlocked
 	toolApprovalMode := m.ctrl.ToolApprovalMode()
 	if m.desktopShortcutLayout() {
 		switch {
@@ -3189,6 +3193,10 @@ func (m chatTUI) modeTagText() string {
 			return "Ask+YOLO"
 		case goalMode && toolApprovalMode == control.ToolApprovalYolo:
 			return "Goal+YOLO"
+		case goalPaused:
+			return "Goal paused"
+		case goalBlocked:
+			return "Goal blocked"
 		case toolApprovalMode == control.ToolApprovalYolo:
 			return "YOLO"
 		case m.planModeOn():
@@ -3218,6 +3226,10 @@ func (m chatTUI) modeTagText() string {
 		return "Goal+YOLO"
 	case goalMode && toolApprovalMode == control.ToolApprovalAuto:
 		return "Goal+Approve"
+	case goalPaused:
+		return "Goal paused"
+	case goalBlocked:
+		return "Goal blocked"
 	case toolApprovalMode == control.ToolApprovalYolo:
 		return "YOLO"
 	case toolApprovalMode == control.ToolApprovalAuto:
@@ -3686,11 +3698,28 @@ func (m *chatTUI) runGoalSubcommand(input string) tea.Cmd {
 		m.echoLocalCommand(input)
 		m.ctrl.ClearGoal()
 		m.notice(i18n.M.GoalCleared)
+	case control.GoalCommandPause:
+		m.echoLocalCommand(input)
+		if m.ctrl.PauseGoal() {
+			m.notice(i18n.M.GoalPaused)
+		} else {
+			m.notice(i18n.M.GoalNothingToPause)
+		}
+	case control.GoalCommandResume:
+		m.echoLocalCommand(input)
+		if !m.ctrl.ResumeGoal() {
+			m.notice(i18n.M.GoalNothingToResume)
+			return nil
+		}
+		m.notice(fmt.Sprintf(i18n.M.GoalResumedFmt, control.ShortGoalForNotice(m.ctrl.Goal())))
+		return m.startTurn(control.GoalContinuePrompt, input, input)
 	default:
 		m.echoLocalCommand(input)
 		goal := m.ctrl.Goal()
 		if strings.TrimSpace(goal) == "" {
 			m.notice(i18n.M.GoalEmpty)
+		} else if status := m.ctrl.GoalStatus(); status != control.GoalStatusRunning {
+			m.notice(fmt.Sprintf(i18n.M.GoalCurrentStatusFmt, status, goal))
 		} else {
 			m.notice(fmt.Sprintf(i18n.M.GoalCurrentFmt, goal))
 		}

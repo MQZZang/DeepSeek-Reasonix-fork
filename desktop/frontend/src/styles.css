@@ -4309,21 +4309,40 @@ a[href] {
   flex: 0 0 auto;
 }
 
+.composer-meta__control--mode,
 .composer-meta__control--intent {
-  flex: 0 0 auto;
-  gap: 6px;
-  min-width: 32px;
-  max-width: min(132px, 24vw);
-}
-
-.composer-meta--has-intent-chip .composer-meta__control--intent {
-  max-width: none;
+  flex: 0 0 100px;
+  min-width: 100px;
+  max-width: 128px;
 }
 
 .composer-meta__control--approval {
-  flex: 0 0 232px;
-  min-width: 216px;
-  max-width: min(232px, 34vw);
+  flex: 0 0 112px;
+  min-width: 112px;
+  max-width: 128px;
+}
+
+.composer-meta__control--token {
+  flex: 0 0 92px;
+  min-width: 92px;
+  max-width: 108px;
+}
+
+.tokensw__trigger--explicit .modelsw__kind {
+  color: var(--accent);
+}
+
+.modesw__kind,
+.permissionsw__kind {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-faint);
+}
+
+.modesw__trigger--explicit .modesw__kind,
+.permissionsw__trigger--explicit .permissionsw__kind {
+  color: currentColor;
 }
 
 .composer-modebar {
@@ -4628,6 +4647,21 @@ a[href] {
   max-width: 72px;
 }
 
+.composer-mode-chip--goal-paused,
+.composer-mode-chip--goal-blocked {
+  flex: 0 0 84px;
+  min-width: 84px;
+  max-width: 84px;
+}
+
+.composer-mode-chip--goal-paused .composer-mode-chip__label {
+  color: var(--warn, #d29922);
+}
+
+.composer-mode-chip--goal-blocked .composer-mode-chip__label {
+  color: var(--danger, #f85149);
+}
+
 .composer-mode-chip--plan .composer-mode-chip__label,
 .composer-mode-chip--ask .composer-mode-chip__label,
 .composer-mode-chip--goal .composer-mode-chip__label {
@@ -4701,10 +4735,23 @@ a[href] {
     max-width: 148px;
   }
 
+  .composer-meta__control--mode,
+  .composer-meta__control--intent {
+    flex-basis: 96px;
+    min-width: 96px;
+    max-width: 112px;
+  }
+
   .composer-meta__control--approval {
-    flex-basis: 178px;
-    min-width: 164px;
-    max-width: 178px;
+    flex-basis: 104px;
+    min-width: 104px;
+    max-width: 120px;
+  }
+
+  .composer-meta__control--token {
+    flex-basis: 84px;
+    min-width: 84px;
+    max-width: 96px;
   }
 
   .composer-mode-chip {
@@ -4750,6 +4797,12 @@ a[href] {
 
   .composer-meta__control--effort {
     display: none;
+  }
+
+  .composer-meta__control--token {
+    flex-basis: 72px;
+    min-width: 72px;
+    max-width: 80px;
   }
 
   .composer-meta__control--more {

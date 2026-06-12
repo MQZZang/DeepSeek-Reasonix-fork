@@ -72,6 +72,7 @@ import {
   hydrateComposerProfileFromMeta,
   hydrateComposerProfilesFromTabs,
   patchComposerProfile,
+  shouldSyncGoalToController,
   type ComposerProfile,
   type ComposerProfileField,
 } from "./lib/composerProfile";
@@ -983,6 +984,7 @@ export default function App() {
     ? composerProfilesByTab[activeTabId] ?? backendActiveComposerProfile
     : defaultComposerProfile;
   const goal = composerProfile.goal;
+  const goalStatus = state.meta?.goalStatus;
   const collaborationMode = displayedComposerProfileCollaborationMode(composerProfile);
   const toolApprovalMode = composerProfile.toolApprovalMode;
   const tokenMode: TokenMode = composerProfile.tokenMode;
@@ -1009,7 +1011,8 @@ export default function App() {
         collaborationMode: displayedComposerProfileCollaborationMode(profile),
         toolApprovalMode: profile.toolApprovalMode,
         tokenMode: profile.tokenMode,
-        goal: profile.goal,
+        goal: profile.goal || tab.goal,
+        goalStatus: tab.goalStatus,
         active: tab.id === visibleTabId,
       };
     });
@@ -1144,9 +1147,9 @@ export default function App() {
       await setModel(name);
       await setControllerCollaborationMode(controllerComposerProfileCollaborationMode(composerProfile));
       await setControllerToolApprovalMode(toolApprovalMode);
-      if (goal.trim()) await setControllerGoal(goal);
+      if (shouldSyncGoalToController(goal, goalStatus)) await setControllerGoal(goal);
     },
-    [composerProfile, goal, setControllerCollaborationMode, setControllerGoal, setControllerToolApprovalMode, setModel, toolApprovalMode],
+    [composerProfile, goal, goalStatus, setControllerCollaborationMode, setControllerGoal, setControllerToolApprovalMode, setModel, toolApprovalMode],
   );
 
   // Startup and workspace/model rebuilds create a fresh controller in normal
@@ -1157,8 +1160,8 @@ export default function App() {
     if (!controllerReady) return;
     void setControllerCollaborationMode(controllerComposerProfileCollaborationMode(composerProfile));
     void setControllerToolApprovalMode(toolApprovalMode);
-    if (goal.trim()) void setControllerGoal(goal);
-  }, [composerProfile, controllerReady, goal, setControllerCollaborationMode, setControllerGoal, setControllerToolApprovalMode, toolApprovalMode]);
+    if (shouldSyncGoalToController(goal, goalStatus)) void setControllerGoal(goal);
+  }, [composerProfile, controllerReady, goal, goalStatus, setControllerCollaborationMode, setControllerGoal, setControllerToolApprovalMode, toolApprovalMode]);
 
   // The live task list pinned above the composer comes from the most recent
   // successful top-level todo_write result; failed or still-running attempts do
@@ -1342,10 +1345,10 @@ export default function App() {
       if (runningRef.current) { steer(submitText.trim()); return; }
       await setControllerCollaborationMode(controllerComposerProfileCollaborationMode(composerProfile));
       await setControllerToolApprovalMode(toolApprovalMode);
-      if (goal.trim()) await setControllerGoal(goal);
+      if (shouldSyncGoalToController(goal, goalStatus)) await setControllerGoal(goal);
       send(trimmed, submitText.trim());
     },
-    [applyGoal, closeTransientOverlays, collaborationMode, composerProfile, goal, send, runShell, notice, setControllerCollaborationMode, setControllerGoal, setControllerToolApprovalMode, steer, switchModel, t, toolApprovalMode],
+    [applyGoal, closeTransientOverlays, collaborationMode, composerProfile, goal, goalStatus, send, runShell, notice, setControllerCollaborationMode, setControllerGoal, setControllerToolApprovalMode, steer, switchModel, t, toolApprovalMode],
   );
 
   const refreshTabMetas = useCallback(async (): Promise<TabMeta[]> => {
@@ -2497,6 +2500,7 @@ export default function App() {
               toolApprovalMode={toolApprovalMode}
               tokenMode={tokenMode}
               goal={goal}
+              goalStatus={goalStatus}
               cwd={state.meta?.cwd}
               modelLabel={state.meta?.label ?? t("status.connecting")}
               tabId={activeTabId}

@@ -35,17 +35,28 @@ const profileFields: ComposerProfileField[] = ["collaborationMode", "toolApprova
 export const defaultComposerProfile: ComposerProfile = Object.freeze({
   collaborationMode: "normal",
   goalDraftMode: false,
-  toolApprovalMode: "ask",
+  toolApprovalMode: "auto",
   tokenMode: "full",
   goal: "",
   pending: {},
 });
 
-function activeGoal(goal?: string, status?: GoalStatus): string {
+/** Goal states that keep the objective visible in the composer UI. */
+export function goalShowsInUI(status?: GoalStatus): boolean {
+  return status === "running" || status === "paused" || status === "blocked";
+}
+
+/** Goal text shown in the UI; complete/stopped goals are cleared from the profile. */
+export function displayGoal(goal?: string, status?: GoalStatus): string {
   const trimmed = (goal ?? "").trim();
   if (!trimmed) return "";
-  if (status && status !== "running") return "";
+  if (status && !goalShowsInUI(status)) return "";
   return trimmed;
+}
+
+/** Whether pushing goal text to the controller would restart a paused/blocked goal. */
+export function shouldSyncGoalToController(goal: string, status?: GoalStatus): boolean {
+  return goal.trim() !== "" && status === "running";
 }
 
 function profileWithPending(profile: Omit<ComposerProfile, "pending">, pending: ComposerProfilePending = {}): ComposerProfile {
@@ -55,7 +66,7 @@ function profileWithPending(profile: Omit<ComposerProfile, "pending">, pending: 
 export function composerProfileFromTab(tab?: TabMeta | null): ComposerProfile {
   if (!tab) return { ...defaultComposerProfile, pending: {} };
   const legacyMode = normalizeMode(tab.mode);
-  const goal = activeGoal(tab.goal, tab.goalStatus);
+  const goal = displayGoal(tab.goal, tab.goalStatus);
   return profileWithPending({
     collaborationMode: normalizeCollaborationMode(tab.collaborationMode, goal, legacyMode),
     goalDraftMode: false,
@@ -68,7 +79,7 @@ export function composerProfileFromTab(tab?: TabMeta | null): ComposerProfile {
 export function composerProfileFromMeta(meta?: Meta | null, legacyMode?: Mode): ComposerProfile {
   if (!meta) return { ...defaultComposerProfile, pending: {} };
   const fallbackMode = normalizeMode(legacyMode);
-  const goal = activeGoal(meta.goal, meta.goalStatus);
+  const goal = displayGoal(meta.goal, meta.goalStatus);
   const toolApprovalMode = normalizeToolApprovalMode(meta.toolApprovalMode, fallbackMode, meta.autoApproveTools ?? meta.bypass);
   return profileWithPending({
     collaborationMode: normalizeCollaborationMode(meta.collaborationMode, goal, fallbackMode),

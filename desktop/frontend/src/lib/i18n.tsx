@@ -119,9 +119,25 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
   return <I18nContext.Provider value={{ locale, pref, setPref, t: tt }}>{children}</I18nContext.Provider>;
 }
 
+function fallbackI18n(): I18nValue {
+  const locale = currentLocale;
+  return {
+    locale,
+    pref: "",
+    setPref: () => {},
+    t: (key, vars) => translate(locale, key, vars),
+  };
+}
+
 export function useI18n(): I18nValue {
   const ctx = useContext(I18nContext);
-  if (!ctx) throw new Error("useI18n must be used within a LocaleProvider");
+  if (!ctx) {
+    // Vite HMR can reload this module and create a fresh context while the tree
+    // still mounts against the previous provider instance. Fall back to the module
+    // mirror so dev sessions survive locale edits without a hard refresh.
+    if (import.meta.hot) return fallbackI18n();
+    throw new Error("useI18n must be used within a LocaleProvider");
+  }
   return ctx;
 }
 

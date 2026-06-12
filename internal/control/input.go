@@ -74,6 +74,10 @@ const (
 	GoalStatusPaused = "paused"
 )
 
+// GoalContinuePrompt is the synthetic user turn that resumes a goal loop after
+// /goal resume or an auto-continue iteration.
+const GoalContinuePrompt = "Continue pursuing the active goal. If it is complete, provide the concise final result and end with [goal:complete]. If it is truly blocked on a user-owned decision after trying sensible defaults, end with [goal:blocked:<short reason>]. Otherwise do the next useful work and end with [goal:continue]."
+
 // StripComposePrefixes removes controller-injected prefixes from a composed
 // user message so that the display text matches what the user actually typed.
 // It strips the PlanModeMarker, <memory-update>…</memory-update>, and

@@ -384,6 +384,12 @@ func TestMetaReportsGoalStatus(t *testing.T) {
 		t.Fatalf("goal meta = %+v, want running goal", meta)
 	}
 
+	tab.Ctrl.PauseGoal()
+	meta = app.MetaForTab(tab.ID)
+	if meta.Goal != "finish the goal runner" || meta.GoalStatus != control.GoalStatusPaused || meta.CollaborationMode != "goal" {
+		t.Fatalf("paused goal meta = %+v, want paused goal with goal collaboration mode", meta)
+	}
+
 	app.ClearGoalForTab(tab.ID)
 	meta = app.MetaForTab(tab.ID)
 	if meta.Goal != "" || meta.GoalStatus != control.GoalStatusStopped || meta.CollaborationMode != "normal" {

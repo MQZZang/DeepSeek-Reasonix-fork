@@ -222,10 +222,7 @@ const (
 	memoryForgetTool   = "forget"
 )
 
-const (
-	maxGoalAutoTurns = 50
-	goalContinueTurn = "Continue pursuing the active goal. If it is complete, provide the concise final result and end with [goal:complete]. If it is truly blocked on a user-owned decision after trying sensible defaults, end with [goal:blocked:<short reason>]. Otherwise do the next useful work and end with [goal:continue]."
-)
+const maxGoalAutoTurns = 50
 
 // RememberResult describes what happened when an approval rule was persisted.
 type RememberResult struct {
@@ -690,7 +687,7 @@ func (c *Controller) continueGoal(ctx context.Context) error {
 			c.stopGoal(GoalStatusPaused)
 			return err
 		}
-		if err := c.runTurnWithRawDisplay(ctx, goalContinueTurn, goalContinueTurn, ""); err != nil {
+		if err := c.runTurnWithRawDisplay(ctx, GoalContinuePrompt, GoalContinuePrompt, ""); err != nil {
 			if ctx.Err() != nil {
 				c.stopGoal(GoalStatusPaused)
 			}
@@ -1040,7 +1037,7 @@ func (c *Controller) applyGoalCommand(input, display string) bool {
 		c.notice(fmt.Sprintf(i18n.M.GoalResumedFmt, ShortGoalForNotice(c.Goal())))
 		if c.runner != nil {
 			c.runGuarded(func(ctx context.Context) error {
-				return c.runGoalLoopWithRawDisplay(ctx, goalContinueTurn, goalContinueTurn, display)
+				return c.runGoalLoopWithRawDisplay(ctx, GoalContinuePrompt, GoalContinuePrompt, display)
 			})
 		}
 	default:

@@ -1,12 +1,17 @@
 // Run: tsx src/__tests__/composer-profile.test.ts
 
 import {
+  composerProfileFromMeta,
+  composerProfileFromTab,
   composerProfileMode,
   controllerComposerProfileCollaborationMode,
+  displayGoal,
   displayedComposerProfileCollaborationMode,
+  goalShowsInUI,
   hydrateComposerProfileFromMeta,
   hydrateComposerProfilesFromTabs,
   patchComposerProfile,
+  shouldSyncGoalToController,
   type ComposerProfilesByTab,
 } from "../lib/composerProfile";
 import type { Meta, TabMeta } from "../lib/types";
@@ -65,6 +70,22 @@ function meta(overrides: Partial<Meta> = {}): Meta {
 }
 
 console.log("\ncomposer profile");
+
+{
+  eq(displayGoal("ship it", "paused"), "ship it", "paused goal stays visible");
+  eq(displayGoal("ship it", "blocked"), "ship it", "blocked goal stays visible");
+  eq(displayGoal("ship it", "complete"), "", "complete goal clears from profile");
+  eq(goalShowsInUI("paused"), true, "paused counts as UI-active goal");
+  eq(shouldSyncGoalToController("ship it", "paused"), false, "paused goal must not sync to controller");
+  eq(shouldSyncGoalToController("ship it", "running"), true, "running goal syncs to controller");
+
+  const pausedTab = composerProfileFromTab(tab({ goal: "ship it", goalStatus: "paused", collaborationMode: "goal" }));
+  eq(pausedTab.goal, "ship it", "paused tab profile keeps goal text");
+  eq(displayedComposerProfileCollaborationMode(pausedTab), "goal", "paused tab keeps goal collaboration mode");
+
+  const pausedMeta = composerProfileFromMeta(meta({ goal: "ship it", goalStatus: "paused", collaborationMode: "goal" }));
+  eq(pausedMeta.goal, "ship it", "paused meta profile keeps goal text");
+}
 
 {
   let profiles: ComposerProfilesByTab = {};

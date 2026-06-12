@@ -519,7 +519,7 @@ func (a *App) OpenProjectTab(workspaceRoot, topicID string) (TabMeta, error) {
 		TopicTitle:       topicTitle,
 		tokenMode:        boot.TokenModeFull,
 		mode:             "normal",
-		toolApprovalMode: control.ToolApprovalAsk,
+		toolApprovalMode: control.ToolApprovalAuto,
 		disabledMCP:      map[string]ServerView{},
 	}
 	tab.sink = &tabEventSink{tabID: tabID, app: a}
@@ -564,7 +564,7 @@ func (a *App) OpenGlobalTab(topicID string) (TabMeta, error) {
 		TopicTitle:       topicTitle,
 		tokenMode:        boot.TokenModeFull,
 		mode:             "normal",
-		toolApprovalMode: control.ToolApprovalAsk,
+		toolApprovalMode: control.ToolApprovalAuto,
 		disabledMCP:      map[string]ServerView{},
 	}
 	tab.sink = &tabEventSink{tabID: tabID, app: a}
@@ -633,7 +633,7 @@ func (a *App) EnsureBlankTab(scope, workspaceRoot string) (TabMeta, error) {
 	var inheritedEffort *string
 	inheritedTokenMode := boot.TokenModeFull
 	inheritedMode := "normal"
-	inheritedToolApprovalMode := control.ToolApprovalAsk
+	inheritedToolApprovalMode := control.ToolApprovalAuto
 	inheritedDisabledMCP := map[string]ServerView{}
 	var inheritedMCPOrder []string
 	if active := a.activeTabLocked(); active != nil {
@@ -3097,10 +3097,22 @@ func currentTabCollaborationMode(tab *WorkspaceTab) string {
 			return "ask"
 		}
 	}
-	if strings.TrimSpace(currentTabGoal(tab)) != "" && currentTabGoalStatus(tab) == control.GoalStatusRunning {
+	if goalShowsCollaborationMode(currentTabGoal(tab), currentTabGoalStatus(tab)) {
 		return "goal"
 	}
 	return "normal"
+}
+
+func goalShowsCollaborationMode(goal, status string) bool {
+	if strings.TrimSpace(goal) == "" {
+		return false
+	}
+	switch status {
+	case control.GoalStatusRunning, control.GoalStatusPaused, control.GoalStatusBlocked:
+		return true
+	default:
+		return false
+	}
 }
 
 func currentTabToolApprovalMode(tab *WorkspaceTab) string {

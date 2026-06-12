@@ -224,7 +224,7 @@ export function StatusBar({
         </Tooltip>
         {planMode && <span className="statusbar__plan">{t("status.plan")}</span>}
         {askMode && <span className="statusbar__ask">{t("status.collabAsk")}</span>}
-        {goalMode && <span className="statusbar__plan">{t("composer.goalMode")}</span>}
+        {goalMode && !goalPaused && !goalBlocked && <span className="statusbar__plan">{t("composer.goalMode")}</span>}
         {goalPaused && <span className="statusbar__goal-paused">{t("status.goalPaused")}</span>}
         {goalBlocked && <span className="statusbar__goal-blocked">{t("status.goalBlocked")}</span>}
         {toolApprovalMode === "auto" && (
