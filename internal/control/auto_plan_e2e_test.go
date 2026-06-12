@@ -49,18 +49,20 @@ func textTurn(text string) []provider.Chunk {
 }
 
 // TestAutoPlanGateEndToEnd drives the whole gate through a real agent: a complex
-// request auto-enters plan mode (marker reaches the model), the agent answers
-// with a plan, the controller asks for approval, and on approval it exits plan
-// mode, seeds the task list, and runs the execution turn.
+// request auto-enters plan mode (marker reaches the model), the agent submits
+// its plan with submit_plan and presents it as text, the controller asks for
+// approval, and on approval it exits plan mode, seeds the task list from the
+// structured submission, and runs the execution turn.
 func TestAutoPlanGateEndToEnd(t *testing.T) {
 	prov := &scriptedTurns{turns: [][]provider.Chunk{
+		toolCallTurn("c1", "submit_plan", `{"title":"Implement issue 2395","phases":[{"name":"Add the config field"},{"name":"Wire it into boot"},{"name":"Add tests"}]}`),
 		textTurn("Plan:\n1. Add the config field\n2. Wire it into boot\n3. Add tests"),
 		textTurn("Done — implemented the plan."),
 	}}
 	ag := agent.New(prov, tool.NewRegistry(), agent.NewSession(""), agent.Options{}, event.Discard)
 
 	approvalID := make(chan string, 1)
-	var seeded bool
+	var seededArgs string
 	c := New(Options{
 		AutoPlan: "on",
 		Runner:   ag,
@@ -70,8 +72,8 @@ func TestAutoPlanGateEndToEnd(t *testing.T) {
 			case event.ApprovalRequest:
 				approvalID <- e.Approval.ID
 			case event.ToolDispatch:
-				if e.Tool.ID == "plan-seed" {
-					seeded = true
+				if e.Tool.ID == "plan-seed" && seededArgs == "" {
+					seededArgs = e.Tool.Args
 				}
 			}
 		}),
@@ -91,19 +93,30 @@ func TestAutoPlanGateEndToEnd(t *testing.T) {
 	if c.PlanMode() {
 		t.Fatal("plan mode should be off after approval")
 	}
-	if !seeded {
+	// The task list is seeded from the structured submission, not from parsing
+	// the reply text — the seed cannot drift from the approved plan (B1).
+	if seededArgs == "" {
 		t.Fatal("approved plan should seed the task list")
+	}
+	for _, phase := range []string{"Add the config field", "Wire it into boot", "Add tests"} {
+		if !strings.Contains(seededArgs, phase) {
+			t.Fatalf("seeded todos = %s, want submitted phase %q", seededArgs, phase)
+		}
+	}
+	if !strings.Contains(seededArgs, `"in_progress"`) {
+		t.Fatalf("seeded todos = %s, want the first item in_progress", seededArgs)
 	}
 	if got := lastAssistantText(msgs); got != "Done — implemented the plan." {
 		t.Fatalf("last assistant text = %q, want the execution turn's answer", got)
 	}
-	if prov.call != 2 {
-		t.Fatalf("provider called %d times, want 2 (plan + execution)", prov.call)
+	if prov.call != 3 {
+		t.Fatalf("provider called %d times, want 3 (submit + plan reply + execution)", prov.call)
 	}
 }
 
 func TestApprovedPlanSeedClearsAfterExecutionWithoutModelTodoWrite(t *testing.T) {
 	prov := &scriptedTurns{turns: [][]provider.Chunk{
+		toolCallTurn("c1", "submit_plan", `{"title":"Implement issue 2395","phases":[{"name":"Add the config field"},{"name":"Wire it into boot"}]}`),
 		textTurn("Plan:\n1. Add the config field\n2. Wire it into boot"),
 		textTurn("Done."),
 	}}
@@ -147,9 +160,10 @@ func TestApprovedPlanSeedClearsAfterExecutionWithoutModelTodoWrite(t *testing.T)
 }
 
 // TestAutoPlanGateRejectionStaysInPlan proves a rejected plan keeps plan mode on
-// and never runs the execution turn: only the plan turn reached the model.
+// and never runs the execution turn: only the submission round reached the model.
 func TestAutoPlanGateRejectionStaysInPlan(t *testing.T) {
 	prov := &scriptedTurns{turns: [][]provider.Chunk{
+		toolCallTurn("c1", "submit_plan", `{"title":"Implement issue 2395","phases":[{"name":"Add the config field"},{"name":"Add tests"}]}`),
 		textTurn("Plan:\n1. Add the config field\n2. Add tests"),
 	}}
 	ag := agent.New(prov, tool.NewRegistry(), agent.NewSession(""), agent.Options{}, event.Discard)
@@ -185,7 +199,7 @@ func TestAutoPlanGateRejectionStaysInPlan(t *testing.T) {
 	if seeded {
 		t.Fatal("rejected plan must not seed the task list")
 	}
-	if prov.call != 1 {
-		t.Fatalf("provider called %d times, want 1 (plan only, no execution)", prov.call)
+	if prov.call != 2 {
+		t.Fatalf("provider called %d times, want 2 (submit + plan reply, no execution)", prov.call)
 	}
 }

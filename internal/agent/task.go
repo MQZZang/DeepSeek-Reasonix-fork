@@ -148,7 +148,23 @@ func (t *TaskTool) Schema() json.RawMessage {
 // ReadOnly is false: a sub-agent can invoke any whitelisted tool, including
 // writers. Conservative classification keeps the parallel-dispatch path from
 // running two sub-agents at once and letting their writes race.
+// IsReadOnlyCommand handles per-invocation ceiling admission — see below.
 func (t *TaskTool) ReadOnly() bool { return false }
+
+// IsReadOnlyCommand satisfies the agent.commandReadOnly optional interface.
+// Foreground task calls return true because the sub-agent will inherit the
+// parent's CeilingReadOnly (read via CeilingFromContext in Execute), so the
+// sub-agent cannot do more than the ceiling permits. Background tasks run
+// in a separate job-manager context where ceiling inheritance is not
+// tracked, so they are classified conservatively (false → blocked under
+// a read-only ceiling), preserving the sandbox boundary.
+func (t *TaskTool) IsReadOnlyCommand(args json.RawMessage) bool {
+	var p struct {
+		RunInBackground bool `json:"run_in_background"`
+	}
+	_ = json.Unmarshal(args, &p)
+	return !p.RunInBackground
+}
 
 // ResolveProfile extracts model/effort from task args and applies config defaults.
 func (t *TaskTool) ResolveProfile(args json.RawMessage) *event.Profile {
@@ -440,6 +456,10 @@ func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *too
 		CompactRatio:      t.compactRatio,
 		CompactForceRatio: t.compactForceRatio,
 		ArchiveDir:        t.archiveDir,
+		// Inherit the parent's ceiling so a task spawned under plan/ask mode
+		// cannot perform writes even if the LLM tries. CeilingFromContext reads
+		// the value stamped by the parent executeOne via WithCeiling.
+		Ceiling: CeilingFromContext(ctx),
 	}, sink)
 }
 

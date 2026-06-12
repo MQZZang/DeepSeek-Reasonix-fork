@@ -282,8 +282,13 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
   hard block in *every* mode: the tool never executes and the model receives a
   "blocked" result it can adapt to (the same shape as a plan-mode refusal).
 - **Relationship to plan mode.** Plan mode (§3.4) is an orthogonal, coarser gate
-  that refuses *all* writers regardless of policy; it is checked first. The
-  permission layer is the fine-grained, always-on gate underneath it.
+  (the read-only capability ceiling) checked before the policy. It refuses
+  writer tools, with one per-invocation refinement: a statically-writer tool may
+  implement `IsReadOnlyCommand(args)` to admit side-effect-free calls — bash
+  admits commands the permission classifier deems read-only (`git log`,
+  `go vet`, …), and `task` admits foreground sub-agents because they inherit
+  the parent's read-only ceiling. The permission layer is the fine-grained,
+  always-on gate underneath it.
 - **User decisions are separate from tool approvals.** Runtime tool approval has
   three user-facing postures: `ask` ("需要批准"), `auto` ("自动批准"), and
   `yolo` ("Yolo批准"). `auto` lets the permission policy auto-approve the writer
@@ -292,12 +297,33 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
   Neither posture answers `ask` questions or approves `exit_plan_mode` plans for
   the user.
   Auto-plan is also a separate feature flag: when enabled, a complex task may
-  still enter plan mode in any tool approval posture. After a user approves a
-  plan, the controller opens a short `approvedPlanAutoApproveTools` execution
-  window so the model can perform the approved writes without re-prompting; that
-  transient window still does not auto-approve future plans. In headless `ask`
-  execution, any fallback answer is labelled as a model assumption, not as a
-  user decision.
+  still enter plan mode in any tool approval posture. In plan mode the approval
+  gate keys on an explicit `submit_plan` tool call (a structured title +
+  phases/steps payload): a plain text reply is conversation and ends the turn
+  without a gate, while a submission is persisted as a markdown artifact under
+  `.reasonix/plans/<id>.md` (frontmatter `status: draft → approved|rejected →
+  executed`) before the user is prompted. A plan-shaped reply that skipped
+  `submit_plan` gets one synthetic nudge to submit; declining ends the turn
+  gateless. The plan approval itself is three-way: **approve** executes,
+  **reject** ends the turn with plan mode still on, and **request changes**
+  (`RevisePlan(id, feedback)`; TUI key `e`, HTTP `POST /approve` with a
+  `feedback` field) marks the artifact rejected and hands the feedback back to
+  the model as a synthetic user turn — the model revises, resubmits, and a
+  fresh gate (and a new draft artifact) is raised within the same turn, one
+  user decision per iteration. After a user approves a plan, the controller
+  opens a labeled checkpoint (`plan-approved: <title>`) at the approve/execute
+  boundary — so the rewind picker offers "back to just before the work
+  started" as one visible jump — then seeds the task list from the structured
+  submission and opens a short `approvedPlanAutoApproveTools` execution window
+  for the duration of that turn. The window waives approval prompts only for
+  previewable file writers (tools implementing `tool.Previewer` — exactly the
+  set whose edits the plan-approved checkpoint snapshots, so every waived
+  write is rewindable); Bash, MCP tools, and other unpreviewable side effects
+  keep their normal approval flow inside the window, and read-only Bash
+  commands never reach the approver in the first place. The window closes when
+  the execution turn returns on any path and never auto-approves future
+  plans. In headless `ask` execution, any fallback answer is labelled as a
+  model assumption, not as a user decision.
 
 - **Collaboration mode is separate from tool approval.** The desktop composer
   presents collaboration as `normal` ("正常模式"), `plan` ("计划模式"), and
@@ -308,9 +334,18 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
   stops it, or the safety continuation limit is reached. Blocked-state matching
   is normalized for casing, whitespace, and punctuation so minor wording drift
   does not reset the audit; restarting a goal begins a fresh blocked audit.
-  `/goal clear` removes it. Switching into plan/normal mode clears the active
-  goal in the desktop UI so the collaboration mode remains one of the three
-  choices, while the underlying tool approval posture is preserved.
+  A goal-mode reply missing its `[goal:*]` status marker is tolerated once;
+  two in a row pause the goal (objective kept) instead of silently burning
+  continuation turns. `/goal pause` suspends a running goal, `/goal resume`
+  continues a paused or blocked one with a fresh audit, and cancelling a turn
+  mid-goal pauses rather than kills it. `/goal clear` removes it. The full
+  goal state (text, status, progress counters) mirrors into the session's
+  branch-meta sidecar on every change, so resuming a session restores its
+  goal — always as paused, never auto-running — while attaching to a session
+  without a stored goal clears any carry-over. Switching into plan/normal mode
+  clears the active goal in the desktop UI so the collaboration mode remains
+  one of the three choices, while the underlying tool approval posture is
+  preserved.
 
 | Tool approval posture | Tool approvals | Plan approval | `ask` questions |
 | --- | --- | --- | --- |

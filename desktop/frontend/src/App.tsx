@@ -75,6 +75,7 @@ import {
   type ComposerProfile,
   type ComposerProfileField,
 } from "./lib/composerProfile";
+import { cycleCollaborationMode, parseAskCommand } from "./lib/collaborationMode";
 import {
   restorableToolApprovalMode,
   toggleYoloToolApprovalMode,
@@ -911,7 +912,6 @@ export default function App() {
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
-  const [pendingPlanRevision, setPendingPlanRevision] = useState<string | null>(null);
   const [footerHeight, setFooterHeight] = useState(0);
   const footerHeightRef = useRef(0);
   const footerRef = useRef<HTMLElement>(null);
@@ -1130,10 +1130,10 @@ export default function App() {
     },
     [applyGoal, send],
   );
-  // Shift+Tab toggles only the collaboration axis; Ctrl/Cmd+Y toggles YOLO on the
-  // tool-permission axis while preserving the Ask/Auto base mode.
+  // Shift+Tab cycles the collaboration axis (normal → plan → ask); Ctrl/Cmd+Y
+  // toggles YOLO on the tool-permission axis while preserving the Ask/Auto base.
   const cycleMode = useCallback(() => {
-    applyCollaborationMode(collaborationMode === "plan" ? "normal" : "plan");
+    applyCollaborationMode(cycleCollaborationMode(collaborationMode));
   }, [applyCollaborationMode, collaborationMode]);
 
   // Switching models rebuilds the controller, which starts in normal mode — so
@@ -1231,13 +1231,6 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (!pendingPlanRevision || state.running) return;
-    const text = pendingPlanRevision;
-    setPendingPlanRevision(null);
-    send(text);
-  }, [pendingPlanRevision, send, state.running]);
-
-  useEffect(() => {
     setClearContextPending(false);
   }, [activeTabId]);
 
@@ -1303,6 +1296,15 @@ export default function App() {
         } else if (["clear", "off", "stop", "done"].includes(arg.toLowerCase())) {
           applyGoal("");
         }
+        send(trimmed, submitText.trim());
+        return;
+      }
+      const askCommand = parseAskCommand(trimmed);
+      if (askCommand) {
+        const nextCollab: CollaborationMode = askCommand.action === "off" ? "normal" : "ask";
+        applyCollaborationMode(nextCollab);
+        await setControllerCollaborationMode(nextCollab);
+        await setControllerToolApprovalMode(toolApprovalMode);
         send(trimmed, submitText.trim());
         return;
       }
@@ -2466,8 +2468,7 @@ export default function App() {
                   approve(state.approval!.id, allow, session, persist);
                 }}
                 onRevisePlan={(text) => {
-                  setPendingPlanRevision(text);
-                  approve(state.approval!.id, false, false, false);
+                  void app.RevisePlan(state.approval!.id, text);
                 }}
                 onExitPlan={() => {
                   applyCollaborationMode("normal");

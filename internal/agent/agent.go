@@ -114,6 +114,36 @@ type Gate interface {
 	Check(ctx context.Context, toolName string, args json.RawMessage, readOnly bool) (allow bool, reason string, err error)
 }
 
+// commandReadOnly is an optional interface a tool may implement to refine the
+// ceiling check on a per-invocation basis. When CeilingReadOnly is active and
+// t.ReadOnly() returns false, executeOne performs a type-assert to this interface;
+// if present, it calls IsReadOnlyCommand with the actual args — returning true
+// means this specific invocation is safe under the ceiling and proceeds past the
+// ceiling check (permission gate and hooks still run). Implementing this
+// interface does not change the static ReadOnly() classification used by the
+// parallel-dispatch batch partitioner.
+type commandReadOnly interface {
+	IsReadOnlyCommand(args json.RawMessage) bool
+}
+
+// ceilingCtxKey is the key used to stamp the parent agent's ceiling onto a
+// tool-call context so ceiling-inheriting sub-agents (task) can read it.
+type ceilingCtxKey struct{}
+
+// WithCeiling stamps the ceiling onto ctx. executeOne stamps the parent
+// ceiling so any sub-agent spawned by a tool call (task.Execute) can
+// read it via CeilingFromContext.
+func WithCeiling(ctx context.Context, c Ceiling) context.Context {
+	return context.WithValue(ctx, ceilingCtxKey{}, c)
+}
+
+// CeilingFromContext returns the ceiling stamped by the nearest parent
+// executeOne, or CeilingFull (0) when no stamp is present.
+func CeilingFromContext(ctx context.Context) Ceiling {
+	c, _ := ctx.Value(ceilingCtxKey{}).(Ceiling)
+	return c
+}
+
 // ToolHooks fires user-configured shell hooks around each tool call. PreToolUse
 // runs before the call and may block it (block=true; message is the reason fed
 // back to the model); PostToolUse runs after and only surfaces output to the
@@ -176,12 +206,13 @@ type Agent struct {
 	lastPrefixShape     PrefixShape
 	haveLastPrefixShape bool
 
-	// planMode, when true, refuses any tool call whose ReadOnly() is false.
-	// The system prompt and tool list never change with the toggle so the
-	// prompt-cache prefix stays valid; the gating happens at execute time
-	// and the model sees a "blocked" result it can adapt to. Toggled from
-	// the outside via SetPlanMode.
-	planMode atomic.Bool
+	// ceiling is the capability ceiling (see Ceiling). Under CeilingReadOnly,
+	// executeOne refuses any tool call whose ReadOnly() is false. The system
+	// prompt and tool list never change with the ceiling so the prompt-cache
+	// prefix stays valid; the gating happens at execute time and the model
+	// sees a "blocked" result it can adapt to. Toggled from the outside via
+	// SetCeiling (or the SetPlanMode compatibility shim).
+	ceiling atomic.Int32
 
 	// gate, when non-nil, is the per-call permission gate consulted after the
 	// plan-mode check. nil disables gating entirely.
@@ -279,11 +310,16 @@ type Agent struct {
 	repeatSuccessCounts map[string]int
 }
 
-// SetPlanMode flips the read-only gate. While true, executeOne refuses any
-// non-ReadOnly tool the model calls and returns a "blocked" result instead of
-// running it. The cache-friendly bits — system prompt, tools schema, message
-// history — are left untouched, so the toggle costs nothing in cache hits.
-func (a *Agent) SetPlanMode(v bool) { a.planMode.Store(v) }
+// SetPlanMode flips the read-only capability ceiling. Compatibility shim for
+// the plan-mode callers: true maps to CeilingReadOnly, false to CeilingFull.
+// New mode work should call SetCeiling directly.
+func (a *Agent) SetPlanMode(v bool) {
+	if v {
+		a.SetCeiling(CeilingReadOnly)
+		return
+	}
+	a.SetCeiling(CeilingFull)
+}
 
 // SetGate installs the per-call permission gate. Used by `reasonix chat` to swap the
 // headless gate built in setup for an interactive one that prompts the user;
@@ -455,6 +491,12 @@ type Options struct {
 
 	// ProjectChecks are host-observable structured checks extracted during boot.
 	ProjectChecks []instruction.VerifyCheck
+
+	// Ceiling is the initial capability ceiling for the agent. The zero value
+	// is CeilingFull (no restriction). Set to CeilingReadOnly to create a
+	// sub-agent that inherits the parent's read-only boundary (used by the
+	// task tool for ceiling-inheriting sub-agents under plan/ask mode).
+	Ceiling Ceiling
 }
 
 // New constructs an Agent. MaxSteps <= 0 means no cap — the run loop continues
@@ -489,7 +531,7 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 	if strings.TrimSpace(maxStepsKey) == "" {
 		maxStepsKey = "agent.max_steps"
 	}
-	return &Agent{
+	a := &Agent{
 		prov:              prov,
 		tools:             tools,
 		session:           session,
@@ -510,6 +552,10 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 		recentKeep:        opts.RecentKeep,
 		archiveDir:        opts.ArchiveDir,
 	}
+	if opts.Ceiling != CeilingFull {
+		a.SetCeiling(opts.Ceiling)
+	}
+	return a
 }
 
 // Run appends the user input and drives the tool loop until the model returns a
@@ -694,7 +740,9 @@ func (a *Agent) finalReadinessCheck() finalReadinessCheck {
 	}
 	var missing []string
 	out := finalReadinessCheck{}
-	if !a.planMode.Load() {
+	// Under a read-only ceiling the agent cannot execute work, so open todos
+	// (e.g. a freshly drafted plan) must not block the reply.
+	if a.Ceiling() == CeilingFull {
 		incomplete, hasTodos := a.evidence.IncompleteLatestTodos()
 		if !hasTodos && a.evidence.HasAnySuccessfulReceipt() {
 			incomplete, hasTodos = a.incompleteCanonicalTodos()
@@ -1289,11 +1337,21 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			errMsg:  "blocked by loop guard",
 		}
 	}
-	if a.planMode.Load() && !t.ReadOnly() {
-		return toolOutcome{
-			output:  fmt.Sprintf("blocked: %q is a writer tool and plan mode is read-only. Keep exploring with read-only tools, then write your plan as your reply — the user will be asked to approve it before any changes are made.", call.Name),
-			blocked: true,
-			errMsg:  "blocked: plan mode is read-only",
+	if a.Ceiling() == CeilingReadOnly && !t.ReadOnly() {
+		// Per-invocation refinement: a tool that is statically ReadOnly()==false
+		// (conservative batch-dispatch classification) may implement commandReadOnly
+		// to self-report that a specific call is actually side-effect-free.
+		// bash uses this to let `git log`, `grep`, etc. through while still
+		// blocking `rm -rf`. task uses it to signal that a foreground sub-agent
+		// will inherit the ceiling. Mode-neutral wording on the blocked path:
+		// plan and ask both run under this ceiling, and the turn-tail marker
+		// carries the mode-specific guidance. Pinned byte-for-byte by B2/B3.
+		if cro, ok := t.(commandReadOnly); !ok || !cro.IsReadOnlyCommand(json.RawMessage(call.Arguments)) {
+			return toolOutcome{
+				output:  fmt.Sprintf("blocked: %q is a writer tool and the current mode is read-only. Keep working with read-only tools and follow this turn's mode instructions for how to proceed when changes are needed.", call.Name),
+				blocked: true,
+				errMsg:  "blocked: read-only mode",
+			}
 		}
 	}
 	if a.gate != nil {
@@ -1338,7 +1396,10 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 			}
 		}
 	}
-	cctx := withCallContext(ctx, call.ID, a.sink, a.asker, a.planMode.Load())
+	cctx := withCallContext(ctx, call.ID, a.sink, a.asker, a.Ceiling() == CeilingReadOnly)
+	// Stamp the parent ceiling so ceiling-inheriting sub-agent tools (task)
+	// can read it via CeilingFromContext and apply it to the sub-agent.
+	cctx = WithCeiling(cctx, a.Ceiling())
 	if a.evidence != nil {
 		cctx = evidence.WithLedger(cctx, a.evidence)
 		cctx = evidence.WithSessionMessages(cctx, a.session.Snapshot())

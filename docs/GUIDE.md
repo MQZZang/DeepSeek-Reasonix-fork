@@ -80,7 +80,8 @@ For the full schema and every field's contract, see [`SPEC.md` §5](./SPEC.md#5-
 
 Shortcuts are documented by client because users usually look for the keys that
 work in the surface they are using. The small rule is: `Shift+Tab` only controls
-Plan, `Ctrl/Cmd+Y` only controls YOLO, and paste stays on the platform paste key.
+the collaboration axis (Plan, and in the CLI also answer-only Ask), `Ctrl/Cmd+Y`
+only controls YOLO, and paste stays on the platform paste key.
 
 ### Desktop GUI
 
@@ -97,13 +98,14 @@ Plan, `Ctrl/Cmd+Y` only controls YOLO, and paste stays on the platform paste key
 
 | Key or command | What it does | Notes |
 | --- | --- | --- |
-| `Shift+Tab` | Toggles Plan on/off | Plan is read-only planning and does not cycle Ask/Auto/YOLO. |
+| `Shift+Tab` | Cycles normal → Plan → Ask (answer-only) → normal | Plan and Ask are read-only collaboration modes; the cycle never touches the Ask/Auto/YOLO approval posture. |
 | `Ctrl+Y` | Toggles YOLO on/off | Turning YOLO off restores the previous Ask/Auto base when known. Terminals that forward Command/Super may also send `Cmd+Y`, but `Ctrl+Y` is the reliable terminal shortcut. |
 | `--yolo`, `--dangerously-skip-permissions` | Starts chat in YOLO | Same runtime mode as `Ctrl+Y`. |
 | Ask / Auto | No keyboard cycle | Ask is the default interactive base. Auto is not entered through `Shift+Tab`; use clients or APIs that expose the tool approval posture directly. |
 | `Ctrl+V` | Pastes clipboard content | The CLI tries a clipboard image first, then falls back to text paste. |
 | `/paste-image` | Pastes a clipboard image | Use it when you want image-only paste or the terminal handles text paste itself. |
-| `/goal <objective>`, `/goal status`, `/goal clear` | Starts, checks, or clears Goal | Goal is not in any keyboard cycle. |
+| `/goal <objective>`, `/goal status`, `/goal pause`, `/goal resume`, `/goal clear` | Starts, checks, pauses/resumes, or clears Goal | Goal is not in any keyboard cycle. Starting a goal leaves Plan/Ask. Two replies in a row without a `[goal:*]` marker pause the goal automatically; cancelling a turn pauses rather than kills it. Goals survive restart: a resumed session restores its goal as paused. |
+| `/ask`, `/ask <question>`, `/ask off` | Enters answer-only Ask mode, asks once, or leaves it | Read-only: writers are refused by the harness and replies end without any approval prompt. |
 
 `[ui].shortcut_layout` is still accepted for old configs, but the shortcut
 behavior above is unified across layouts.
@@ -116,7 +118,7 @@ Mode meanings:
 | Auto | Auto-allows fallback approvals; explicit `ask` / `deny` rules still apply. |
 | YOLO | Skips ordinary tool approval prompts; `deny`, user `ask` questions, and plan approval prompts still wait. |
 | Plan | Keeps the next work read-only until a plan is approved or Plan is turned off. |
-| Goal | Pursues a saved objective until complete, blocked, or cleared. |
+| Goal | Pursues a saved objective until complete, blocked, paused, or cleared; paused goals resume with `/goal resume`. |
 
 ## Permissions & sandbox
 
@@ -273,7 +275,15 @@ specific skills such as `review` or `security_review`.
 For interactive frontends, plan mode is manual by default. Set
 `agent.auto_plan = "on"` to make complex-looking tasks enter plan mode
 automatically: Reasonix first drafts a read-only plan, then waits for approval
-before editing or running side-effecting commands. `auto_plan_classifier` can
+before editing or running side-effecting commands. The approval prompt is
+three-way: approve and execute (`y`/Enter in chat), request changes (`e`, then
+describe what to change — the model revises and resubmits in the same turn), or
+reject and keep planning (`n`/Esc). Approving also drops a
+`plan-approved: <title>` checkpoint, so `/rewind` can jump back to just before
+the work started. Approval covers the plan's file edits: during the execution
+turn, file-editing tools run without per-edit prompts (each edit is still
+snapshotted into that checkpoint), while shell commands and other
+side-effecting tools keep their normal approval prompts. `auto_plan_classifier` can
 name a cheap provider such as `deepseek-flash`; it is only called for borderline
 inputs and falls back to the heuristic if classification fails. Use
 `/auto-plan off|on` in `reasonix chat` to change the user-level setting, or

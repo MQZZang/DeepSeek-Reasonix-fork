@@ -10,10 +10,52 @@ import (
 
 var reComposeBlock = regexp.MustCompile(`(?s)^\s*<(?:memory-update|background-jobs)>.*?</(?:memory-update|background-jobs)>\s*\n`)
 
+// Collaboration modes — the intent axis of a session, orthogonal to the tool
+// approval axis (ask/auto/yolo). Plan and Ask both run under the agent's
+// read-only capability ceiling; they differ in lifecycle: plan gates its
+// proposal behind an approval, ask just answers and stops.
+const (
+	CollabNormal = "normal"
+	CollabPlan   = "plan"
+	CollabAsk    = "ask"
+)
+
+// NormalizeCollaborationMode maps free-form input to a known collaboration
+// mode, defaulting to normal.
+func NormalizeCollaborationMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case CollabPlan:
+		return CollabPlan
+	case CollabAsk:
+		return CollabAsk
+	default:
+		return CollabNormal
+	}
+}
+
 // PlanModeMarker is prepended to every user turn while plan mode is on. It rides
 // in the user message (not the system prompt or tools), so the cache-stable
 // prompt prefix is left untouched and the toggle costs nothing in cache hits.
-const PlanModeMarker = "[Plan mode — read-only. Explore the codebase first (read_file, ls, grep, glob, web_fetch, task, ask are available; writers are refused by the harness). Before planning, if a decision that is genuinely the user's — tech stack, an ambiguous requirement, scope, an irreversible choice — would materially shape the plan and you can't settle it from the codebase or a sensible default, use the ask tool to clarify it first; otherwise pick the obvious default and state the assumption in the plan instead of asking. Then present a LAYERED plan as your reply and stop — do not write files, edit, or run side-effecting bash. Structure the plan as a two-level markdown list so it becomes a layered task list: each PHASE is a top-level numbered list item (a coherent milestone, e.g. \"1. Add the config loader\"), and each phase's concrete, verifiable sub-steps are bullets indented beneath it (e.g. \"   - parse the TOML into Config\"). Use plain numbered list items for phases — do NOT write phases as markdown headings (##, ###) — so both levels parse. Keep phases few (about 2-6). The user will be asked to approve before any changes are made.]"
+const PlanModeMarker = "[Plan mode — read-only. Explore the codebase first (read_file, ls, grep, glob, web_fetch, bash (read-only commands such as git log / git diff / go vet / grep), task, ask are available; writer tools and side-effecting bash are refused by the harness). Before planning, if a decision that is genuinely the user's — tech stack, an ambiguous requirement, scope, an irreversible choice — would materially shape the plan and you can't settle it from the codebase or a sensible default, use the ask tool to clarify it first; otherwise pick the obvious default and state the assumption in the plan instead of asking. When the plan is ready, submit it by calling the submit_plan tool: a short imperative title plus 2-6 phases (each a coherent milestone, e.g. \"Add the config loader\"), each phase carrying its concrete, verifiable steps (e.g. \"parse the TOML into Config\"). Only submit_plan raises the approval gate — a plain text reply is conversation, not a proposal, so answer questions freely. After calling submit_plan, present the same plan in your reply as a two-level markdown list (each PHASE a top-level numbered item, its steps indented bullets beneath; do NOT write phases as markdown headings) and stop — do not write files, edit, or run side-effecting bash. The user will be asked to approve before any changes are made.]"
+
+// planSubmitNudgeMessage is the one-shot synthetic user turn injected when a
+// plan-mode reply LOOKS like a plan (markdown list items) but the model never
+// called submit_plan. The model is the only party who knows whether its text
+// was a proposal, so it gets exactly one chance to submit; declining (another
+// reply without a submission) ends the turn without a gate. Listed in
+// syntheticPrefixes so UIs never render it as a user bubble.
+const planSubmitNudgeMessage = "You wrote what looks like a plan but did not call submit_plan. If that was your proposed plan, call submit_plan now with its title and phases, then stop. If you were only answering or discussing, reply briefly without calling submit_plan."
+
+// planReviseMessage is the synthetic user turn that carries the "request
+// changes" feedback from the plan approval card back to the model. The user's
+// feedback text is appended verbatim. Listed in syntheticPrefixes so UIs never
+// render the wrapper as a user bubble — frontends echo the raw feedback their
+// own way.
+const planReviseMessage = "The user reviewed the submitted plan and requests changes before approving it. Plan mode is still on. Revise the plan accordingly and submit the updated plan with submit_plan, then present it briefly and stop. Requested changes: "
+
+// AskModeMarker is prepended to every user turn while ask mode is on. Same
+// turn-tail discipline as PlanModeMarker: the cache-stable prefix never moves.
+const AskModeMarker = "[Ask mode — answer-only. Explore with read-only tools (read_file, ls, grep, glob, web_fetch, bash (read-only commands such as git log / git diff / go vet / grep), task); writer tools and side-effecting bash are refused by the harness. Answer the question directly and cite concrete evidence (file paths, line numbers, command output) where it helps. Do NOT change files or start making changes in this mode — if the request actually needs changes, say so in one short line and suggest switching to Agent mode (or Plan mode for larger work), then stop.]"
 
 const (
 	activeGoalOpen  = "<active-goal>"
@@ -25,6 +67,11 @@ const (
 	GoalStatusComplete = "complete"
 	GoalStatusBlocked  = "blocked"
 	GoalStatusStopped  = "stopped"
+	// GoalStatusPaused marks a goal that is suspended but resumable: the model
+	// went markerless twice in a row, the user paused it (/goal pause), the
+	// turn was cancelled, or the goal was restored from the session sidecar on
+	// resume. The objective text is kept; /goal resume continues the loop.
+	GoalStatusPaused = "paused"
 )
 
 // StripComposePrefixes removes controller-injected prefixes from a composed
@@ -47,6 +94,8 @@ func StripComposePrefixes(content string) string {
 	}
 	s = strings.TrimPrefix(s, PlanModeMarker+"\n\n")
 	s = strings.TrimPrefix(s, PlanModeMarker)
+	s = strings.TrimPrefix(s, AskModeMarker+"\n\n")
+	s = strings.TrimPrefix(s, AskModeMarker)
 	s = strings.TrimSpace(s)
 	return s
 }
@@ -76,6 +125,8 @@ func IsSyntheticUserMessage(content string) bool {
 // messages the chat UI must never render as user bubbles (#3653).
 var syntheticPrefixes = []string{
 	"Plan approved — plan mode is off",
+	"You wrote what looks like a plan but did not call submit_plan",
+	"The user reviewed the submitted plan and requests changes",
 	"Host final-answer readiness check failed",
 	"You are already in the executor phase",
 	"The previous assistant response was interrupted while a tool call",
@@ -87,12 +138,12 @@ var syntheticPrefixes = []string{
 	"Summary of earlier conversation (compacted up to here):",
 }
 
-// Compose applies the plan-mode marker to a turn's text when plan mode is on,
-// returning the message to actually send to the model. The frontend keeps
-// showing the raw text as the user bubble.
+// Compose applies the collaboration-mode marker to a turn's text when plan or
+// ask mode is on, returning the message to actually send to the model. The
+// frontend keeps showing the raw text as the user bubble.
 func (c *Controller) Compose(text string) string {
 	c.mu.Lock()
-	plan := c.planMode
+	collab := c.collabMode
 	goal := c.goal
 	goalStatus := c.goalStatus
 	notes := c.pendingMemory
@@ -102,8 +153,11 @@ func (c *Controller) Compose(text string) string {
 	if strings.TrimSpace(goal) != "" && goalStatus == GoalStatusRunning {
 		text = activeGoalBlock(goal) + "\n\n" + text
 	}
-	if plan {
+	switch collab {
+	case CollabPlan:
 		text = PlanModeMarker + "\n\n" + text
+	case CollabAsk:
+		text = AskModeMarker + "\n\n" + text
 	}
 
 	// Memory added mid-session rides the turn (never the cached system prefix),
@@ -181,6 +235,8 @@ const (
 	GoalCommandStatus GoalCommandAction = iota + 1
 	GoalCommandSet
 	GoalCommandClear
+	GoalCommandPause
+	GoalCommandResume
 )
 
 type GoalCommand struct {
@@ -188,6 +244,9 @@ type GoalCommand struct {
 	Text   string
 }
 
+// ParseGoalCommand parses the "/goal" family. Bare keywords act on the active
+// goal (status / pause / resume / clear); anything else is a new objective.
+// Only the bare word is a verb — "/goal resume the migration" sets a goal.
 func ParseGoalCommand(input string) (GoalCommand, bool) {
 	trimmed := strings.TrimSpace(input)
 	if trimmed != "/goal" && !strings.HasPrefix(trimmed, "/goal ") && !strings.HasPrefix(trimmed, "/goal\t") {
@@ -199,8 +258,43 @@ func ParseGoalCommand(input string) (GoalCommand, bool) {
 		return GoalCommand{Action: GoalCommandStatus}, true
 	case "clear", "off", "stop", "done":
 		return GoalCommand{Action: GoalCommandClear}, true
+	case "pause":
+		return GoalCommand{Action: GoalCommandPause}, true
+	case "resume", "continue":
+		return GoalCommand{Action: GoalCommandResume}, true
 	default:
 		return GoalCommand{Action: GoalCommandSet, Text: args}, true
+	}
+}
+
+// AskCommand is a parsed "/ask …" line. Bare "/ask" turns ask mode on,
+// "/ask off" leaves it, and "/ask <question>" turns it on and asks right away.
+type AskCommandAction int
+
+const (
+	AskCommandOn AskCommandAction = iota
+	AskCommandOff
+	AskCommandQuestion
+)
+
+type AskCommand struct {
+	Action AskCommandAction
+	Text   string
+}
+
+func ParseAskCommand(input string) (AskCommand, bool) {
+	trimmed := strings.TrimSpace(input)
+	if trimmed != "/ask" && !strings.HasPrefix(trimmed, "/ask ") && !strings.HasPrefix(trimmed, "/ask\t") {
+		return AskCommand{}, false
+	}
+	args := strings.TrimSpace(trimmed[len("/ask"):])
+	switch strings.ToLower(args) {
+	case "", "on":
+		return AskCommand{Action: AskCommandOn}, true
+	case "off", "exit", "stop", "clear":
+		return AskCommand{Action: AskCommandOff}, true
+	default:
+		return AskCommand{Action: AskCommandQuestion, Text: args}, true
 	}
 }
 

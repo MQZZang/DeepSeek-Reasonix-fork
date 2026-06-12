@@ -103,6 +103,8 @@ export interface AppBindings {
   CancelTab(tabID: string): Promise<void>;
   Approve(id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
   ApproveTab(tabID: string, id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
+  RevisePlan(id: string, feedback: string): Promise<void>;
+  RevisePlanTab(tabID: string, id: string, feedback: string): Promise<void>;
   AnswerQuestion(id: string, answers: QuestionAnswer[]): Promise<void>;
   AnswerQuestionForTab(tabID: string, id: string, answers: QuestionAnswer[]): Promise<void>;
   ReplayPendingPrompts(): Promise<void>;
@@ -1432,6 +1434,14 @@ function makeMockApp(): AppBindings {
         async ApproveTab(_tabID, id, allow, session, persist) {
           await withMockTabScope(_tabID, () => this.Approve(id, allow, session, persist));
         },
+        async RevisePlan(id, feedback) {
+          void id;
+          emit({ kind: "message", text: `plan revision preview: ${feedback}` });
+          emitMockTurnDone();
+        },
+        async RevisePlanTab(_tabID, id, feedback) {
+          await withMockTabScope(_tabID, () => this.RevisePlan(id, feedback));
+        },
         async AnswerQuestion(_id, answers) {
       if (!pendingAskPreview) return;
       pendingAskPreview = false;
@@ -1482,7 +1492,7 @@ function makeMockApp(): AppBindings {
             return {
               ...tab,
               collaborationMode: next,
-              goal: next === "normal" || next === "plan" ? "" : tab.goal,
+              goal: next === "normal" || next === "plan" || next === "ask" ? "" : tab.goal,
               mode: modeWithPlan(modeWithAutoApproveTools(normalizeMode(tab.mode), toolMode === "yolo"), next === "plan"),
             };
           });

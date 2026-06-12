@@ -180,7 +180,7 @@ function fmtElapsed(ms: number): string {
 
 // --- past:chats hover preview helpers (PR-C2) ---
 // Pure formatting helpers used by the past:chats list tooltip. They never read
-// from disk, never call PreviewSession — they only shape the data that already
+// from disk, never call PreviewSession ? they only shape the data that already
 // lives in the SessionMeta snapshot we fetched on entry.
 const PAST_CHAT_PREVIEW_MAX = 200;
 
@@ -233,15 +233,15 @@ function isImeKeyEvent(
   );
 }
 
-// --- past:chats session reference → prompt context (PR-B) ---
+// --- past:chats session reference ? prompt context (PR-B) ---
 // Send-side helpers for "@past:chats" session references. PR-A wired the menu and
 // the composer-context card; this layer reads each referenced session through the
-// existing PreviewSession API and prepends a compact "user / 助手" transcript to
+// existing PreviewSession API and prepends a compact "user / ??" transcript to
 // submitText so the model sees the referenced chat as background context.
 const SESSION_REF_MAX_MESSAGES = 30;
 const SESSION_REF_MAX_CHARS = 20_000;
-const SESSION_CONTEXT_HEADER = "以下是用户引用的历史会话上下文：";
-const SESSION_CONTEXT_FOOTER = "当前用户问题：";
+const SESSION_CONTEXT_HEADER = "????????????????";
+const SESSION_CONTEXT_FOOTER = "???????";
 const PAST_CHATS_MENU_ITEM = "past:chats";
 
 // limitSessionMessages keeps the most recent useful messages within a char budget.
@@ -286,12 +286,12 @@ function formatSessionContext(
   truncated: boolean,
 ): string {
   const body = messages
-    .map((m) => `${m.role === "user" ? "用户" : "助手"}：${m.content.trim()}`)
+    .map((m) => `${m.role === "user" ? "??" : "??"}?${m.content.trim()}`)
     .join("\n\n");
   return [
-    `[会话：${ref.title}]`,
-    truncated ? "注意：该会话内容较长，以下只包含最近部分内容。" : "",
-    body || "注意：该会话没有可引用的用户/助手消息。",
+    `[???${ref.title}]`,
+    truncated ? "???????????????????????" : "",
+    body || "??????????????/?????",
   ]
     .filter(Boolean)
     .join("\n");
@@ -299,7 +299,7 @@ function formatSessionContext(
 
 // buildSessionContext reads each referenced session, formats the most recent
 // slice, and joins them with a separator. A single failed read must not block
-// the others; the user gets a clear "读取失败" note for the bad one and the
+// the others; the user gets a clear "????" note for the bad one and the
 // remaining refs still flow through.
 async function buildSessionContext(refs: SessionReference[]): Promise<string> {
   if (refs.length === 0) return "";
@@ -311,7 +311,7 @@ async function buildSessionContext(refs: SessionReference[]): Promise<string> {
       context += `${formatSessionContext(ref, limited.messages, limited.truncated)}\n\n---\n\n`;
     } catch (error) {
       console.error("[past:chats] failed to preview session", ref.path, error);
-      context += `[会话：${ref.title}]\n注意：该会话读取失败，已跳过。\n\n---\n\n`;
+      context += `[???${ref.title}]\n???????????????\n\n---\n\n`;
     }
   }
   context += `${SESSION_CONTEXT_FOOTER}\n`;
@@ -468,9 +468,9 @@ export function Composer({
   );
 
   // --- slash argument completion ("/cmd <args>") --- mirrors the CLI: once past
-  // the command word, the backend suggests sub-commands (/skill → list/show/…,
-  // /mcp → add/remove, /model → refs). Fetched from app.SlashArgs. Debounced
-  // by 120ms so rapid typing doesn't flood the backend with IPC calls — the
+  // the command word, the backend suggests sub-commands (/skill ? list/show/?,
+  // /mcp ? add/remove, /model ? refs). Fetched from app.SlashArgs. Debounced
+  // by 120ms so rapid typing doesn't flood the backend with IPC calls ? the
   // menu only updates after the user pauses.
   const [argRes, setArgRes] = useState<SlashArgsResult | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -486,12 +486,12 @@ export function Composer({
         .SlashArgs(text)
         .then((r) => {
           if (!live) return;
-          // Drop suggestions that wouldn't change the input — the token is already
+          // Drop suggestions that wouldn't change the input ? the token is already
           // fully typed (e.g. "/skill list" offering "list"). Otherwise the menu
           // lingers on a complete command and Enter keeps "accepting" a no-op
           // instead of sending. (Defense-in-depth: the backend filters these too.)
           // r.items can arrive as null (an empty Go slice serializes to JSON null),
-          // so guard before filtering — otherwise the throw is swallowed and the
+          // so guard before filtering ? otherwise the throw is swallowed and the
           // stale menu from the previous keystroke lingers (the /skill list bug).
           const items = asArray(r?.items);
           const from = r?.from ?? 0;
@@ -510,7 +510,7 @@ export function Composer({
   // --- @ file references (token at the end of the text) ---
   // atRaw is everything after a trailing "@token"; atDir is its path up to the
   // last "/", atFrag the part after. The menu lists one directory level (atDir)
-  // and filters by atFrag — descending one level per pick.
+  // and filters by atFrag ? descending one level per pick.
   const atRaw = useMemo(() => {
     const m = /(?:^|\s)@([^\s]*)$/.exec(text);
     return m ? m[1] : null;
@@ -537,7 +537,7 @@ export function Composer({
   // shows stale results (issue #3601).
   const prevCwdRef = useRef(cwd);
   useEffect(() => {
-    if (prevCwdRef.current === cwd) return; // skip mount — state already initial
+    if (prevCwdRef.current === cwd) return; // skip mount ? state already initial
     prevCwdRef.current = cwd;
     dirCache.current = {};
     searchCache.current = {};
@@ -622,7 +622,7 @@ export function Composer({
 
 
   // --- which menu (if any) is open --- (slash command names win; then slash
-  // arguments; then @-refs — they're rarely valid at once)
+  // arguments; then @-refs ? they're rarely valid at once)
   const menuMode: "slash" | "slasharg" | "at" | null =
     slashMatches.length > 0 && !dismissed
       ? "slash"
@@ -815,6 +815,7 @@ export function Composer({
   });
 
   const planModeOn = collaborationMode === "plan";
+  const askModeOn = collaborationMode === "ask";
   const activeGoal = (goal ?? "").trim();
   const goalModeOn = collaborationMode === "goal";
   const tokenModeOn = tokenMode === "economy";
@@ -847,7 +848,7 @@ export function Composer({
     // PR-B: when past:chats refs are attached, prepend their formatted transcript
     // to submitText only (displayText stays unchanged so the user still sees their
     // original prompt in the input preview). With no refs we keep the original
-    // submitText verbatim — no header, no rewording, byte-identical to pre-PR-B.
+    // submitText verbatim ? no header, no rewording, byte-identical to pre-PR-B.
     const sessionContext = sessionRefs.length === 0 ? "" : await buildSessionContext(sessionRefs);
     const baseSubmitText = [expandPastedBlocks(trimmedText), refs].filter(Boolean).join(trimmedText && refs ? " " : "");
     const submitText = sessionContext ? `${sessionContext}${baseSubmitText}` : baseSubmitText;
@@ -894,7 +895,7 @@ export function Composer({
   };
 
   // Non-image pastes (PDFs, docs): the clipboard hands us bytes, not a path, so
-  // the kernel stores them and we reference the saved path — attached, not ignored.
+  // the kernel stores them and we reference the saved path ? attached, not ignored.
   const attachOtherFiles = async (files: File[]) => {
     const others = files.filter((f) => !f.type.startsWith("image/"));
     if (others.length === 0) return;
@@ -1056,7 +1057,7 @@ export function Composer({
     }
 
     // OS file drops deliver no usable bytes/paths here; the native bridge
-    // (onFilesDropped → AttachDropped) handles them. Just clear the hover state.
+    // (onFilesDropped ? AttachDropped) handles them. Just clear the hover state.
     if (hasFileDrag(e.dataTransfer)) setDragOver(false);
   };
 
@@ -1463,6 +1464,12 @@ export function Composer({
       requestAnimationFrame(() => taRef.current?.focus());
     });
   };
+  const chooseAskMode = () => {
+    closeIntentMenu(() => {
+      onSetCollaborationMode(askModeOn ? "normal" : "ask");
+      requestAnimationFrame(() => taRef.current?.focus());
+    });
+  };
   const chooseGoalMode = () => {
     if (goalModeOn) {
       closeIntentMenu(() => {
@@ -1506,14 +1513,14 @@ export function Composer({
           const elapsedMs = Math.max(0, now - turnStartAt);
           const words = SPINNER_WORDS[locale];
           const word = words[Math.floor(elapsedMs / 3000) % words.length];
-          const tok = turnTokens && turnTokens > 0 ? ` · ↓ ${fmtTokens(turnTokens)} ${t("status.tokens")}` : "";
-          return `${word}… ${fmtElapsed(elapsedMs)}${tok}`;
+          const tok = turnTokens && turnTokens > 0 ? ` ? ? ${fmtTokens(turnTokens)} ${t("status.tokens")}` : "";
+          return `${word}? ${fmtElapsed(elapsedMs)}${tok}`;
         })()
       : null;
   const composerMetaClass = [
     "composer-meta",
     hasEffort ? "composer-meta--has-effort" : "composer-meta--no-effort",
-    planModeOn || goalModeOn || tokenModeOn ? "composer-meta--has-intent-chip" : "composer-meta--no-intent-chip",
+    planModeOn || askModeOn || goalModeOn || tokenModeOn ? "composer-meta--has-intent-chip" : "composer-meta--no-intent-chip",
   ].join(" ");
 
   return (
@@ -1545,6 +1552,22 @@ export function Composer({
               <span className="composer-access-menu__desc">{t("composer.planModeDesc")}</span>
             </span>
             <span className={`composer-intent-switch${planModeOn ? " composer-intent-switch--on" : ""}`} aria-hidden="true">
+              <span />
+            </span>
+          </button>
+          <button
+            type="button"
+            className={`composer-access-menu__item composer-intent-menu__item${askModeOn ? " composer-access-menu__item--active" : ""}`}
+            onClick={chooseAskMode}
+            disabled={disabled || running}
+            title={askModeOn ? t("composer.exitCollabAskTitle") : t("composer.enterCollabAskTitle")}
+          >
+            <MessageSquare size={16} />
+            <span className="composer-access-menu__copy">
+              <span className="composer-access-menu__title">{t("composer.collabAsk")}</span>
+              <span className="composer-access-menu__desc">{t("composer.collabAskDesc")}</span>
+            </span>
+            <span className={`composer-intent-switch${askModeOn ? " composer-intent-switch--on" : ""}`} aria-hidden="true">
               <span />
             </span>
           </button>
@@ -1624,11 +1647,11 @@ export function Composer({
           <div className="slashmenu" role="listbox">
             {loadingPastChats ? (
               <div className="slashmenu__item slashmenu__item--empty">
-                <span className="slashmenu__name">正在加载历史会话...</span>
+                <span className="slashmenu__name">????????...</span>
               </div>
             ) : pastChats.length === 0 ? (
               <div className="slashmenu__item slashmenu__item--empty">
-                <span className="slashmenu__name">暂无历史会话</span>
+                <span className="slashmenu__name">??????</span>
               </div>
             ) : (
               <>
@@ -1637,7 +1660,7 @@ export function Composer({
                   <input
                     className="slashmenu__search"
                     type="text"
-                    placeholder="搜索历史会话…"
+                    placeholder="???????"
                     value={pastChatQuery}
                     autoFocus
                     onChange={(ev) => {
@@ -1649,12 +1672,12 @@ export function Composer({
                 </div>
                 {filteredPastChats.length === 0 ? (
                   <div className="slashmenu__item slashmenu__item--empty">
-                    <span className="slashmenu__name">没有匹配的历史会话</span>
+                    <span className="slashmenu__name">?????????</span>
                   </div>
                 ) : (
                   filteredPastChats.map((session, i) => {
                     // PR-C2: hover preview uses only the SessionMeta fields we
-                    // already have on hand — no extra PreviewSession call, no
+                    // already have on hand ? no extra PreviewSession call, no
                     // backend round-trip, no read of the full transcript.
                     const turns = typeof session.turns === "number";
                     const ts = session.lastActivityAt || session.modTime || session.createdAt;
@@ -1667,8 +1690,8 @@ export function Composer({
                           {preview && <div className="past-chat-hover__preview">{preview}</div>}
                           {(turns || ts) && (
                             <div className="past-chat-hover__meta">
-                              {turns && <span>{session.turns} 轮</span>}
-                              {ts && <span>· {fmtSessionTime(ts)}</span>}
+                              {turns && <span>{session.turns} ?</span>}
+                              {ts && <span>? {fmtSessionTime(ts)}</span>}
                             </div>
                           )}
                           {pathText && <div className="past-chat-hover__path">{pathText}</div>}
@@ -1687,7 +1710,7 @@ export function Composer({
                           <MessageSquare size={13} className="filemenu__icon" />
                           <span className="slashmenu__name slashmenu__name--file">
                             {pastChatTitle(session)}
-                            {turns ? ` (${session.turns} 轮)` : ""}
+                            {turns ? ` (${session.turns} ?)` : ""}
                           </span>
                         </button>
                       </Tooltip>
@@ -1705,7 +1728,7 @@ export function Composer({
                 setActive(0);
               }}
             >
-              <span className="slashmenu__name">← 返回文件列表</span>
+              <span className="slashmenu__name">? ??????</span>
             </button>
           </div>
         ) : (
@@ -1838,11 +1861,11 @@ export function Composer({
                   <MessageSquare size={15} />
                   <span>
                     {ref.title}
-                    {typeof ref.turns === "number" ? ` (${ref.turns} 轮)` : ""}
+                    {typeof ref.turns === "number" ? ` (${ref.turns} ?)` : ""}
                   </span>
                 </span>
               </Tooltip>
-              <Tooltip label="移除引用会话">
+              <Tooltip label="??????">
                 <button
                   type="button"
                   onClick={() => removeSessionRef(ref.path)}
@@ -1907,7 +1930,7 @@ export function Composer({
           onDragOver={onDragOver}
           onDragLeave={onDragLeave}
         >
-          <span className="composer__caret">{shellModeActive ? "$" : "›"}</span>
+          <span className="composer__caret">{shellModeActive ? "$" : "?"}</span>
           <textarea
             ref={taRef}
             className="composer__input"
@@ -1986,6 +2009,26 @@ export function Composer({
                       <X size={11} />
                     </span>
                     <span className="composer-mode-chip__label">{t("composer.modePlan")}</span>
+                  </button>
+                </Tooltip>
+              )}
+              {askModeOn && (
+                <Tooltip label={t("composer.exitCollabAskTitle")}>
+                  <button
+                    type="button"
+                    className="composer-mode-chip composer-mode-chip--ask"
+                    onClick={chooseAskMode}
+                    disabled={disabled}
+                    title={t("composer.exitCollabAskTitle")}
+                    aria-label={t("composer.exitCollabAskTitle")}
+                  >
+                    <span className="composer-mode-chip__icon composer-mode-chip__icon--mode" aria-hidden="true">
+                      <MessageSquare size={14} />
+                    </span>
+                    <span className="composer-mode-chip__icon composer-mode-chip__icon--dismiss" aria-hidden="true">
+                      <X size={11} />
+                    </span>
+                    <span className="composer-mode-chip__label">{t("composer.collabAsk")}</span>
                   </button>
                 </Tooltip>
               )}

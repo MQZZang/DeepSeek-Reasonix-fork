@@ -651,7 +651,7 @@ func TestUserBubbleEchoedImmediately(t *testing.T) {
 	// Stand in for startTurn's immediate echo (no controller in the unit harness).
 	m.bubbleStartIdx = len(m.transcript)
 	m.commitLine("")
-	m.commitLine(renderUserBubble("hello world", m.width, m.planMode))
+	m.commitLine(renderUserBubble("hello world", m.width, m.collabMode))
 	m.bubblePending = true
 	m.state = tuiRunning
 
@@ -681,7 +681,7 @@ func TestUserBubbleIsLightweightTranscriptLine(t *testing.T) {
 	colorEnabled = true
 	defer func() { colorEnabled = prevColor }()
 
-	got := renderUserBubble("hello world", 80, false)
+	got := renderUserBubble("hello world", 80, control.CollabNormal)
 	plain := ansi.Strip(got)
 	if !strings.Contains(plain, "› hello world") {
 		t.Fatalf("user bubble missing prompt text: %q", plain)
@@ -1398,7 +1398,7 @@ func TestUnsendRestoresFoldedPastePlaceholder(t *testing.T) {
 	m.ctrl = control.New(control.Options{})
 	m.bubbleStartIdx = len(m.transcript)
 	m.commitLine("")
-	m.commitLine(renderUserBubble("expanded JSON", m.width, m.planMode))
+	m.commitLine(renderUserBubble("expanded JSON", m.width, m.collabMode))
 	m.pendingRestore = "[Pasted text #1 · 5 lines] 这是什么?"
 	m.bubblePending = true
 	m.state = tuiRunning
@@ -1719,25 +1719,25 @@ func TestCtrlCCopyBeatsClearInput(t *testing.T) {
 }
 
 // TestEscInPlanModeDoesNotExitPlan — regression for the part of PR #3051 that
-// was missed: Esc was still falling into the case m.planMode branch. The
-// Shift+Tab cycle is the only path that flips plan mode; Esc must only
+// was missed: Esc was still falling into the plan-mode branch. The Shift+Tab
+// cycle is the only path that flips the collaboration mode; Esc must only
 // rewind / clear input. PR #3051 already removed the equivalent YOLO branch;
 // the m.ctrl.SetBypass path is exercised end-to-end in control/yolo_test.go
 // and intentionally not duplicated here.
 func TestEscInPlanModeDoesNotExitPlan(t *testing.T) {
 	m := newTestChatTUI()
-	m.planMode = true
+	m.collabMode = control.CollabPlan
 
 	esc := tea.KeyPressMsg{Code: tea.KeyEsc}
 	out, _ := m.Update(esc)
 	m2 := out.(chatTUI)
 
-	if !m2.planMode {
+	if !m2.planModeOn() {
 		t.Error("Esc must not exit plan mode; only Shift+Tab should")
 	}
 }
 
-func TestDesktopShortcutLayoutShiftTabTogglesPlanOnly(t *testing.T) {
+func TestDesktopShortcutLayoutShiftTabCyclesPlanAskNormal(t *testing.T) {
 	m := newTestChatTUI()
 	m.ctrl = control.New(control.Options{})
 	m.ctrl.SetToolApprovalMode(control.ToolApprovalAuto)
@@ -1749,8 +1749,8 @@ func TestDesktopShortcutLayoutShiftTabTogglesPlanOnly(t *testing.T) {
 	shiftTab := tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift}
 	out, _ := m.Update(shiftTab)
 	m = out.(chatTUI)
-	if !m.planMode || !m.ctrl.PlanMode() {
-		t.Fatalf("first Shift+Tab should enter plan mode, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
+	if !m.planModeOn() || !m.ctrl.PlanMode() {
+		t.Fatalf("first Shift+Tab should enter plan mode, tui=%v controller=%v", m.collabMode, m.ctrl.CollaborationMode())
 	}
 	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalAuto {
 		t.Fatalf("Shift+Tab changed approval mode to %q, want auto", got)
@@ -1758,11 +1758,20 @@ func TestDesktopShortcutLayoutShiftTabTogglesPlanOnly(t *testing.T) {
 
 	out, _ = m.Update(shiftTab)
 	m = out.(chatTUI)
-	if m.planMode || m.ctrl.PlanMode() {
-		t.Fatalf("second Shift+Tab should leave plan mode, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
+	if !m.askModeOn() || m.ctrl.CollaborationMode() != control.CollabAsk {
+		t.Fatalf("second Shift+Tab should enter ask mode, tui=%v controller=%v", m.collabMode, m.ctrl.CollaborationMode())
+	}
+	if m.ctrl.PlanMode() {
+		t.Fatal("ask mode must not report plan mode")
+	}
+
+	out, _ = m.Update(shiftTab)
+	m = out.(chatTUI)
+	if m.collabMode != control.CollabNormal || m.ctrl.CollaborationMode() != control.CollabNormal {
+		t.Fatalf("third Shift+Tab should return to normal, tui=%v controller=%v", m.collabMode, m.ctrl.CollaborationMode())
 	}
 	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalAuto {
-		t.Fatalf("second Shift+Tab changed approval mode to %q, want auto", got)
+		t.Fatalf("Shift+Tab cycle changed approval mode to %q, want auto", got)
 	}
 }
 
@@ -1777,8 +1786,8 @@ func TestDesktopShortcutLayoutShiftTabClearsGoalWhenEnteringPlan(t *testing.T) {
 
 	out, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift})
 	m = out.(chatTUI)
-	if !m.planMode || !m.ctrl.PlanMode() {
-		t.Fatalf("Shift+Tab should enter plan mode, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
+	if !m.planModeOn() || !m.ctrl.PlanMode() {
+		t.Fatalf("Shift+Tab should enter plan mode, tui=%v controller=%v", m.collabMode, m.ctrl.CollaborationMode())
 	}
 	if got := m.ctrl.Goal(); got != "" {
 		t.Fatalf("Shift+Tab entering plan should clear goal, got %q", got)
@@ -1903,6 +1912,27 @@ func TestDesktopShortcutLayoutDoesNotStealCompletionTab(t *testing.T) {
 	}
 }
 
+// TestAskSubcommandSyncsTUIMirror — the /ask family must keep the TUI's
+// collaboration-mode mirror (chip, bubble prefix) in lockstep with the
+// controller, exactly like the Shift+Tab cycle does.
+func TestAskSubcommandSyncsTUIMirror(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+
+	m.runAskSubcommand("/ask")
+	if !m.askModeOn() || m.ctrl.CollaborationMode() != control.CollabAsk {
+		t.Fatalf("/ask: tui=%q controller=%q, want ask/ask", m.collabMode, m.ctrl.CollaborationMode())
+	}
+	if m.ctrl.PlanMode() {
+		t.Fatal("ask mode must not report plan mode")
+	}
+
+	m.runAskSubcommand("/ask off")
+	if m.collabMode != control.CollabNormal || m.ctrl.CollaborationMode() != control.CollabNormal {
+		t.Fatalf("/ask off: tui=%q controller=%q, want normal/normal", m.collabMode, m.ctrl.CollaborationMode())
+	}
+}
+
 func TestShiftTabStillTogglesPlanUnderClassicShortcutLayout(t *testing.T) {
 	m := newTestChatTUI()
 	m.ctrl = control.New(control.Options{})
@@ -1913,10 +1943,97 @@ func TestShiftTabStillTogglesPlanUnderClassicShortcutLayout(t *testing.T) {
 
 	out, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift})
 	m = out.(chatTUI)
-	if !m.planMode || !m.ctrl.PlanMode() {
-		t.Fatalf("Shift+Tab should toggle plan mode, tui=%v controller=%v", m.planMode, m.ctrl.PlanMode())
+	if !m.planModeOn() || !m.ctrl.PlanMode() {
+		t.Fatalf("Shift+Tab should enter plan mode, tui=%v controller=%v", m.collabMode, m.ctrl.CollaborationMode())
 	}
 	if got := m.ctrl.ToolApprovalMode(); got != control.ToolApprovalAsk {
 		t.Fatalf("Shift+Tab changed approval mode to %q", got)
+	}
+}
+
+// TestPlanFeedbackKeyFlow pins the TUI side of the three-way plan approval:
+// `e` on the plan banner opens the feedback composer (banner swaps to the
+// feedback prompt, composer becomes visible), Esc returns to the banner with
+// the approval still pending, and Enter with text answers via RevisePlan and
+// clears the prompt, echoing the feedback into the transcript.
+func TestPlanFeedbackKeyFlow(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{Sink: event.Discard})
+	m.pendingApproval = &event.Approval{ID: "9", Tool: planApprovalTool}
+
+	if !m.hideComposer() {
+		t.Fatal("composer should be hidden while the plan banner is up")
+	}
+
+	out, _ := m.update(tea.KeyPressMsg{Code: 'e'})
+	m = out.(chatTUI)
+	if !m.planFeedback || m.pendingApproval == nil {
+		t.Fatalf("e should open feedback typing with the approval still pending (feedback=%v approval=%v)", m.planFeedback, m.pendingApproval)
+	}
+	if m.hideComposer() {
+		t.Fatal("composer must be visible while typing plan feedback")
+	}
+	// The banner wraps to the terminal width, so match an unwrappable prefix.
+	if banner := m.renderApprovalBanner(); !strings.Contains(banner, "Describe the changes") {
+		t.Fatalf("banner = %q, want the feedback prompt", banner)
+	}
+
+	// Esc backs out without answering: banner returns, approval still pending.
+	out, _ = m.update(tea.KeyPressMsg{Code: tea.KeyEsc})
+	m = out.(chatTUI)
+	if m.planFeedback || m.pendingApproval == nil {
+		t.Fatalf("Esc should return to the banner with the approval pending (feedback=%v approval=%v)", m.planFeedback, m.pendingApproval)
+	}
+	if banner := m.renderApprovalBanner(); !strings.Contains(banner, "Plan ready above") {
+		t.Fatalf("banner = %q, want the approve/revise/reject prompt", banner)
+	}
+
+	// Enter with feedback text answers the approval and clears the prompt.
+	out, _ = m.update(tea.KeyPressMsg{Code: 'e'})
+	m = out.(chatTUI)
+	m.input.SetValue("use a shim instead")
+	out, _ = m.update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = out.(chatTUI)
+	if m.planFeedback || m.pendingApproval != nil {
+		t.Fatalf("Enter should answer and clear the prompt (feedback=%v approval=%v)", m.planFeedback, m.pendingApproval)
+	}
+	if m.input.Value() != "" {
+		t.Fatalf("composer should be reset after sending, got %q", m.input.Value())
+	}
+	if out := strings.Join(m.transcript, "\n"); !strings.Contains(out, "use a shim instead") {
+		t.Fatalf("transcript should echo the feedback, got:\n%s", out)
+	}
+}
+
+// TestPlanFeedbackKeyIgnoredForToolApprovals: `e` is a plan-only affordance —
+// on a tool approval it must not open the feedback composer or answer.
+func TestPlanFeedbackKeyIgnoredForToolApprovals(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{Sink: event.Discard})
+	m.pendingApproval = &event.Approval{ID: "9", Tool: "bash", Subject: "rm -rf /tmp/x"}
+
+	out, _ := m.update(tea.KeyPressMsg{Code: 'e'})
+	m = out.(chatTUI)
+	if m.planFeedback {
+		t.Fatal("e must not open plan feedback on a tool approval")
+	}
+	if m.pendingApproval == nil {
+		t.Fatal("e must not answer a tool approval")
+	}
+}
+
+// TestPlanFeedbackEnterWithoutTextKeepsTyping: an empty Enter sends nothing —
+// the user keeps typing or Escs out, and the approval stays pending.
+func TestPlanFeedbackEnterWithoutTextKeepsTyping(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{Sink: event.Discard})
+	m.pendingApproval = &event.Approval{ID: "9", Tool: planApprovalTool}
+
+	out, _ := m.update(tea.KeyPressMsg{Code: 'e'})
+	m = out.(chatTUI)
+	out, _ = m.update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = out.(chatTUI)
+	if !m.planFeedback || m.pendingApproval == nil {
+		t.Fatalf("empty Enter must keep the feedback prompt open (feedback=%v approval=%v)", m.planFeedback, m.pendingApproval)
 	}
 }

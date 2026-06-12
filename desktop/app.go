@@ -634,6 +634,24 @@ func (a *App) ApproveTab(tabID, id string, allow, session, persist bool) {
 	}
 }
 
+// RevisePlan answers a pending plan approval with "request changes": the plan
+// is not approved, plan mode stays on, and the feedback text goes back to the
+// model, which revises and resubmits within the same turn.
+func (a *App) RevisePlan(id, feedback string) {
+	ctrl := a.ctrlByTabID("")
+	if ctrl != nil {
+		ctrl.RevisePlan(id, feedback)
+	}
+}
+
+// RevisePlanTab is like RevisePlan but scoped to a specific tab.
+func (a *App) RevisePlanTab(tabID, id, feedback string) {
+	ctrl := a.ctrlByTabID(tabID)
+	if ctrl != nil {
+		ctrl.RevisePlan(id, feedback)
+	}
+}
+
 // ReplayPendingPrompts asks every tab's controller to re-emit any approval/ask
 // prompt that is currently blocking its run loop. The frontend calls this once
 // its event subscription is live (on load/reconnect) so a session that was
@@ -740,6 +758,8 @@ func normalizeCollaborationMode(mode string) string {
 		return "plan"
 	case "goal":
 		return "goal"
+	case "ask":
+		return "ask"
 	default:
 		return "normal"
 	}
@@ -765,6 +785,8 @@ func (a *App) SetCollaborationModeForTab(tabID, mode string) {
 	case "goal":
 		tab.mode = tabModeFromAxes(false, approvalMode == control.ToolApprovalYolo)
 	default:
+		// "ask" rides the controller's collaboration axis only: the persisted
+		// tab axes stay plan-free, so a restored tab comes back in normal mode.
 		tab.mode = tabModeFromAxes(false, approvalMode == control.ToolApprovalYolo)
 		tab.goal = ""
 	}
@@ -774,7 +796,16 @@ func (a *App) SetCollaborationModeForTab(tabID, mode string) {
 	tabIDForSave := tab.ID
 	a.mu.Unlock()
 	if ctrl != nil {
-		ctrl.SetPlanMode(plan)
+		switch {
+		case mode == "ask":
+			ctrl.SetCollaborationMode(control.CollabAsk)
+		case plan:
+			ctrl.SetCollaborationMode(control.CollabPlan)
+		default:
+			// Explicit axis set: leaving for normal/goal must also clear a
+			// lingering ask mode, so this is not the plan-only bool shim.
+			ctrl.SetCollaborationMode(control.CollabNormal)
+		}
 		ctrl.SetGoal(goal)
 	}
 	a.mu.Lock()
@@ -1895,7 +1926,15 @@ func (a *App) SetGoalForTab(tabID, goal string) {
 	tabIDForSave := tab.ID
 	a.mu.Unlock()
 	if ctrl != nil {
-		ctrl.SetPlanMode(plan)
+		if goal != "" {
+			// A goal is execution work: leave plan or ask mode for the full
+			// ceiling (mirrors the controller's own /goal rule).
+			ctrl.SetCollaborationMode(control.CollabNormal)
+		} else {
+			// Clearing a goal keeps the collaboration axis as-is: the bool
+			// shim re-asserts plan from the tab axes without yanking ask.
+			ctrl.SetPlanMode(plan)
+		}
 		ctrl.SetGoal(goal)
 	}
 	a.mu.Lock()

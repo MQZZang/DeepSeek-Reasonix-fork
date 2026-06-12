@@ -293,13 +293,13 @@ export interface Meta {
   goalStatus?: GoalStatus;
 }
 
-export type CollaborationMode = "normal" | "plan" | "goal";
+export type CollaborationMode = "normal" | "plan" | "ask" | "goal";
 export type ToolApprovalMode = "ask" | "auto" | "yolo";
 export type TokenMode = "full" | "economy";
 export type GoalStatus = "running" | "complete" | "blocked" | "stopped";
 
 export function normalizeCollaborationMode(mode?: string, goal?: string, legacyMode?: Mode): CollaborationMode {
-  if (mode === "plan" || mode === "goal" || mode === "normal") return mode;
+  if (mode === "plan" || mode === "ask" || mode === "goal" || mode === "normal") return mode;
   if (legacyMode && modeHasPlan(legacyMode)) return "plan";
   if ((goal ?? "").trim()) return "goal";
   return "normal";

@@ -177,6 +177,40 @@ func TestServeApproveMissingID(t *testing.T) {
 	}
 }
 
+// TestServeApproveFeedbackRoutesToRevisePlan: a deny carrying feedback is the
+// "request changes" answer — it must be accepted (204) and routed through
+// RevisePlan rather than rejected as a malformed approve. The controller-side
+// feedback plumbing is pinned in internal/control; this guards the HTTP shape.
+func TestServeApproveFeedbackRoutesToRevisePlan(t *testing.T) {
+	bc := NewBroadcaster()
+	ctrl := control.New(control.Options{Sink: bc})
+	srv := httptest.NewServer(New(ctrl, bc).Handler())
+	defer srv.Close()
+
+	// Unknown IDs are silent no-ops in the controller, so both shapes must be
+	// accepted at the HTTP layer without error.
+	resp, err := http.Post(srv.URL+"/approve", "application/json",
+		strings.NewReader(`{"id":"7","allow":false,"feedback":"use a shim instead"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("approve with feedback = %d, want 204", resp.StatusCode)
+	}
+
+	// Feedback alongside allow=true is ignored: the plain approve path answers.
+	resp2, err := http.Post(srv.URL+"/approve", "application/json",
+		strings.NewReader(`{"id":"7","allow":true,"feedback":"ignored"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNoContent {
+		t.Errorf("approve allow with feedback = %d, want 204", resp2.StatusCode)
+	}
+}
+
 func TestServeNewSessionEndpoint(t *testing.T) {
 	bc := NewBroadcaster()
 	ctrl := control.New(control.Options{Sink: bc})

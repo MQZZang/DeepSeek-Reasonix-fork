@@ -4621,6 +4621,7 @@ a[href] {
 }
 
 .composer-mode-chip--plan,
+.composer-mode-chip--ask,
 .composer-mode-chip--goal {
   flex: 0 0 72px;
   min-width: 72px;
@@ -4628,6 +4629,7 @@ a[href] {
 }
 
 .composer-mode-chip--plan .composer-mode-chip__label,
+.composer-mode-chip--ask .composer-mode-chip__label,
 .composer-mode-chip--goal .composer-mode-chip__label {
   overflow: visible;
   text-overflow: clip;
@@ -5181,6 +5183,10 @@ a[href] {
 }
 .statusbar__plan {
   color: var(--accent);
+  letter-spacing: 0.6px;
+}
+.statusbar__ask {
+  color: var(--info, #58a6ff);
   letter-spacing: 0.6px;
 }
 .statusbar__yolo {

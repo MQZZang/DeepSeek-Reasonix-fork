@@ -85,10 +85,11 @@ type chatTUI struct {
 	// Persists across turns until the work completes or a new session starts.
 	todoArgs string
 
-	// planMode mirrors the agent's read-only gate (Shift+Tab toggles it). The
-	// marker rides in outgoing user messages so the cache-stable prompt prefix is
-	// left untouched.
-	planMode bool
+	// collabMode mirrors the controller's collaboration axis ("" or
+	// control.CollabNormal, control.CollabPlan, control.CollabAsk; Shift+Tab
+	// cycles it). The mode marker rides in outgoing user messages so the
+	// cache-stable prompt prefix is left untouched.
+	collabMode string
 	// yoloRestoreToolApprovalMode remembers the Ask/Auto base mode that Ctrl+Y
 	// should restore after a desktop-style YOLO toggle.
 	yoloRestoreToolApprovalMode string
@@ -202,6 +203,12 @@ type chatTUI struct {
 	// (nil when none). While set, the controller's run goroutine is blocked
 	// awaiting ctrl.Approve and key input is captured to answer it.
 	pendingApproval *event.Approval
+
+	// planFeedback is true while the user is typing "request changes" feedback
+	// for a pending plan approval (entered with `e` on the plan banner). Keys
+	// route to the composer; Enter sends the text via ctrl.RevisePlan, Esc
+	// returns to the approve/revise/reject banner.
+	planFeedback bool
 
 	// chooser holds the `ask` tool's question card (nil when none). While set, the
 	// run goroutine is blocked awaiting ctrl.AnswerQuestion and keys drive the card.
@@ -900,8 +907,12 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleSkillPickerKey(msg)
 		}
 		// A pending tool approval is modal: keystrokes answer it (y/a/n, Enter,
-		// Esc) rather than reaching the input.
+		// Esc) rather than reaching the input. While typing plan-revision
+		// feedback, keys drive the composer instead and Enter sends it.
 		if m.pendingApproval != nil {
+			if m.planFeedback {
+				return m.handlePlanFeedbackKey(msg)
+			}
 			return m.handleApprovalKey(msg)
 		}
 		// While the autocomplete menu is open it captures navigation/accept keys
@@ -1062,8 +1073,9 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.toggleShellOutput()
 			return m, finalize(m, cmds)
 		case "shift+tab":
-			// Shift+Tab toggles Plan only. Tool approval stays on its own axis:
-			// Ask/Auto are explicit choices, and YOLO is a separate Ctrl+Y toggle.
+			// Shift+Tab cycles the collaboration axis (normal → plan → ask).
+			// Tool approval stays on its own axis: Ask/Auto are explicit
+			// choices, and YOLO is a separate Ctrl+Y toggle.
 			m.cycleMode()
 			return m, nil
 		case "enter":
@@ -1136,7 +1148,7 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pendingRestore = line
 				m.bubbleStartIdx = len(m.transcript)
 				m.commitLine("")
-				m.commitLine(renderUserBubble(line, m.width, m.planMode))
+				m.commitLine(renderUserBubble(line, m.width, m.collabMode))
 				m.bubblePending = true
 				m.turnDiscarded = false
 				m.confirmBubbleSent() // shell events arrive instantly
@@ -1496,8 +1508,13 @@ func (m chatTUI) bottomRows() int {
 // reserve rows for a composer that cannot receive input, leaving a confusing
 // blank/bordered area at the bottom of the TUI.
 func (m chatTUI) hideComposer() bool {
-	if m.mcp != nil || m.clearConfirm != nil || m.mcpImport != nil || m.skillPick != nil || m.resumePick != nil || m.rewind != nil || m.pendingApproval != nil {
+	if m.mcp != nil || m.clearConfirm != nil || m.mcpImport != nil || m.skillPick != nil || m.resumePick != nil || m.rewind != nil {
 		return true
+	}
+	if m.pendingApproval != nil {
+		// The plan-revision feedback composer is the active control while the
+		// user types their requested changes; every other approval is keys-only.
+		return !m.planFeedback
 	}
 	return m.chooser != nil && !m.chooser.typing
 }
@@ -2110,14 +2127,16 @@ const planApprovalTool = "exit_plan_mode"
 // 3/p writes an "always allow" rule to the config file, and n/Esc denies.
 // Ctrl-C cancels the whole turn via the run context. For a plan approval
 // (planApprovalTool), allowing also drops the local [plan] tag — the
-// controller turns plan mode off on its side.
+// controller turns plan mode off on its side — and `e` opens the
+// "request changes" feedback composer instead of answering.
 func (m chatTUI) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	answer := func(allow, session, persist bool) (tea.Model, tea.Cmd) {
 		if allow && m.pendingApproval.Tool == planApprovalTool {
-			m.planMode = false
+			m.collabMode = control.CollabNormal
 		}
 		m.ctrl.Approve(m.pendingApproval.ID, allow, session, persist)
 		m.pendingApproval = nil
+		m.planFeedback = false
 		return m, nil
 	}
 	switch msg.String() {
@@ -2132,6 +2151,12 @@ func (m chatTUI) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch strings.ToLower(msg.String()) {
 	case "y", "1":
 		return answer(true, false, false)
+	case "e":
+		if m.pendingApproval.Tool == planApprovalTool {
+			m.planFeedback = true
+			m.input.Reset()
+			return m, nil
+		}
 	case "a", "2":
 		return answer(true, true, false)
 	case "3", "p":
@@ -2140,6 +2165,45 @@ func (m chatTUI) handleApprovalKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return answer(false, false, false)
 	}
 	return m, nil
+}
+
+// handlePlanFeedbackKey drives the composer while the user types "request
+// changes" feedback for a pending plan approval. Enter sends the text via
+// ctrl.RevisePlan (the model revises and resubmits within the same turn), Esc
+// returns to the approve/revise/reject banner, Ctrl-C cancels the whole turn.
+// Everything else edits the input as usual.
+func (m chatTUI) handlePlanFeedbackKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		m.ctrl.Cancel()
+		m.ctrl.Approve(m.pendingApproval.ID, false, false, false)
+		m.pendingApproval = nil
+		m.planFeedback = false
+		m.input.Reset()
+		return m, nil
+	case "esc":
+		m.planFeedback = false
+		m.input.Reset()
+		return m, nil
+	case "enter":
+		feedback := strings.TrimSpace(m.expandPastedBlocks(m.input.Value()))
+		if feedback == "" {
+			return m, nil // nothing to send; keep typing or Esc out
+		}
+		m.commitSpacer()
+		m.commitLine(dim(fmt.Sprintf("  "+i18n.M.PlanFeedbackSentFmt, feedback)))
+		m.transcriptDirty = true
+		m.ctrl.RevisePlan(m.pendingApproval.ID, feedback)
+		m.pendingApproval = nil
+		m.planFeedback = false
+		m.input.Reset()
+		m.growInputToFit()
+		return m, nil
+	}
+	var ic tea.Cmd
+	m.input, ic = m.input.Update(msg)
+	m.growInputToFit()
+	return m, ic
 }
 
 var (
@@ -2183,7 +2247,7 @@ func (m chatTUI) View() tea.View {
 		case m.ctrl.AutoApproveTools():
 			color = statusYoloColor
 			foreground = "#ffffff"
-		case m.planMode:
+		case m.planModeOn(), m.askModeOn():
 			color = statusPlanColor
 			foreground = "#ffffff"
 		}
@@ -2523,8 +2587,12 @@ func (m chatTUI) renderApprovalBanner() string {
 		return ""
 	}
 	// A plan approval shows the gate prompt (the plan itself is already printed as
-	// the assistant's reply); a tool approval names the tool + subject.
+	// the assistant's reply); a tool approval names the tool + subject. While the
+	// user is typing revision feedback the banner explains that state instead.
 	if m.pendingApproval.Tool == planApprovalTool {
+		if m.planFeedback {
+			return approvalBannerStyle.Width(w).Render("⏸ " + i18n.M.PlanFeedbackPrompt)
+		}
 		return approvalBannerStyle.Width(w).Render("⏸ " + i18n.M.PlanApprovalPrompt)
 	}
 	name, detail := approvalToolDetails(m.pendingApproval.Tool)
@@ -3059,15 +3127,27 @@ func pastedFileRef(content string) (string, bool) {
 	return "@" + path, true
 }
 
-// cycleMode handles the Shift+Tab mode gesture. It toggles Plan only; tool
-// approval modes stay on their own axis.
+// cycleMode handles the Shift+Tab mode gesture: normal → plan → ask → normal.
+// Tool approval modes stay on their own axis.
 func (m *chatTUI) cycleMode() {
-	m.planMode = !m.planMode
-	if m.planMode {
+	switch m.collabMode {
+	case control.CollabPlan:
+		m.collabMode = control.CollabAsk
+	case control.CollabAsk:
+		m.collabMode = control.CollabNormal
+	default:
+		m.collabMode = control.CollabPlan
+	}
+	if m.collabMode != control.CollabNormal {
 		m.ctrl.ClearGoal()
 	}
-	m.ctrl.SetPlanMode(m.planMode)
+	m.ctrl.SetCollaborationMode(m.collabMode)
 }
+
+// planModeOn reports whether the TUI mirror is in plan mode; askModeOn ditto
+// for ask mode. Both modes run read-only on the controller side.
+func (m chatTUI) planModeOn() bool { return m.collabMode == control.CollabPlan }
+func (m chatTUI) askModeOn() bool  { return m.collabMode == control.CollabAsk }
 
 func (m chatTUI) desktopShortcutLayout() bool {
 	return m.cfg != nil && m.cfg.UIShortcutLayout() == "desktop"
@@ -3103,14 +3183,18 @@ func (m chatTUI) modeTagText() string {
 	toolApprovalMode := m.ctrl.ToolApprovalMode()
 	if m.desktopShortcutLayout() {
 		switch {
-		case m.planMode && toolApprovalMode == control.ToolApprovalYolo:
+		case m.planModeOn() && toolApprovalMode == control.ToolApprovalYolo:
 			return "Plan+YOLO"
+		case m.askModeOn() && toolApprovalMode == control.ToolApprovalYolo:
+			return "Ask+YOLO"
 		case goalMode && toolApprovalMode == control.ToolApprovalYolo:
 			return "Goal+YOLO"
 		case toolApprovalMode == control.ToolApprovalYolo:
 			return "YOLO"
-		case m.planMode:
+		case m.planModeOn():
 			return "Plan"
+		case m.askModeOn():
+			return "Ask"
 		case goalMode && toolApprovalMode == control.ToolApprovalAuto:
 			return "Goal+Auto"
 		case goalMode:
@@ -3122,10 +3206,14 @@ func (m chatTUI) modeTagText() string {
 		}
 	}
 	switch {
-	case m.planMode && toolApprovalMode == control.ToolApprovalYolo:
+	case m.planModeOn() && toolApprovalMode == control.ToolApprovalYolo:
 		return "Plan+YOLO"
-	case m.planMode && toolApprovalMode == control.ToolApprovalAuto:
+	case m.planModeOn() && toolApprovalMode == control.ToolApprovalAuto:
 		return "Plan+Approve"
+	case m.askModeOn() && toolApprovalMode == control.ToolApprovalYolo:
+		return "Ask+YOLO"
+	case m.askModeOn() && toolApprovalMode == control.ToolApprovalAuto:
+		return "Ask+Approve"
 	case goalMode && toolApprovalMode == control.ToolApprovalYolo:
 		return "Goal+YOLO"
 	case goalMode && toolApprovalMode == control.ToolApprovalAuto:
@@ -3134,8 +3222,10 @@ func (m chatTUI) modeTagText() string {
 		return "YOLO"
 	case toolApprovalMode == control.ToolApprovalAuto:
 		return "Auto+Approve"
-	case m.planMode:
+	case m.planModeOn():
 		return "Plan"
+	case m.askModeOn():
+		return "Ask"
 	case goalMode:
 		return "Goal"
 	default:
@@ -3183,7 +3273,7 @@ func (m *chatTUI) startTurnWithRaw(sent, displayed, restore, raw string) tea.Cmd
 	m.pendingPastes = m.pasteLabelsIn(restore)
 	m.bubbleStartIdx = len(m.transcript)
 	m.commitLine("") // blank line separating turns
-	m.commitLine(renderUserBubble(displayed, m.width, m.planMode))
+	m.commitLine(renderUserBubble(displayed, m.width, m.collabMode))
 	m.bubblePending = true
 	m.turnDiscarded = false
 
@@ -3372,9 +3462,11 @@ func (m *chatTUI) ingestEvent(e event.Event) {
 		// The controller's run goroutine is now blocked inside the gate awaiting
 		// this decision; the banner shows it in View and key input answers it via
 		// ctrl.Approve. At most one prompt is outstanding (the controller
-		// serialises them), so a plain field holds the current one.
+		// serialises them), so a plain field holds the current one. A fresh
+		// request always starts on the banner, not in feedback typing.
 		a := e.Approval
 		m.pendingApproval = &a
+		m.planFeedback = false
 
 	case event.AskRequest:
 		// The `ask` tool raised a question card; the run goroutine blocks until
@@ -3547,6 +3639,8 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 		m.showMemory()
 	case "/goal":
 		return m.runGoalSubcommand(input)
+	case "/ask":
+		return m.runAskSubcommand(input)
 	case "/remember":
 		note := strings.TrimSpace(strings.TrimPrefix(input, cmd))
 		if note == "" {
@@ -3582,8 +3676,9 @@ func (m *chatTUI) runGoalSubcommand(input string) tea.Cmd {
 	}
 	switch cmd.Action {
 	case control.GoalCommandSet:
-		m.planMode = false
-		m.ctrl.SetPlanMode(false)
+		// A goal is execution work: leave plan or ask mode for the full ceiling.
+		m.collabMode = control.CollabNormal
+		m.ctrl.SetCollaborationMode(control.CollabNormal)
 		m.ctrl.SetGoal(cmd.Text)
 		m.notice(fmt.Sprintf(i18n.M.GoalSetFmt, control.ShortGoalForNotice(cmd.Text)))
 		return m.startTurn("Start pursuing the active goal now.", input, input)
@@ -3599,6 +3694,37 @@ func (m *chatTUI) runGoalSubcommand(input string) tea.Cmd {
 		} else {
 			m.notice(fmt.Sprintf(i18n.M.GoalCurrentFmt, goal))
 		}
+	}
+	return nil
+}
+
+// runAskSubcommand mirrors the controller's "/ask" family locally so the TUI's
+// collaboration-mode mirror (chip, bubble prefix) stays in sync: bare "/ask"
+// enters ask mode, "/ask off" leaves it, "/ask <question>" enters it and sends
+// the question as the turn (the marker rides in via the controller's Compose).
+func (m *chatTUI) runAskSubcommand(input string) tea.Cmd {
+	cmd, ok := control.ParseAskCommand(input)
+	if !ok {
+		return nil
+	}
+	switch cmd.Action {
+	case control.AskCommandOn:
+		m.echoLocalCommand(input)
+		m.collabMode = control.CollabAsk
+		m.ctrl.SetCollaborationMode(control.CollabAsk)
+		m.notice(i18n.M.AskModeOn)
+	case control.AskCommandOff:
+		m.echoLocalCommand(input)
+		if m.collabMode == control.CollabAsk {
+			m.collabMode = control.CollabNormal
+			m.ctrl.SetCollaborationMode(control.CollabNormal)
+		}
+		m.notice(i18n.M.AskModeOff)
+	case control.AskCommandQuestion:
+		m.collabMode = control.CollabAsk
+		m.ctrl.SetCollaborationMode(control.CollabAsk)
+		m.notice(i18n.M.AskModeOn)
+		return m.startTurn(cmd.Text, cmd.Text, cmd.Text)
 	}
 	return nil
 }
@@ -3786,7 +3912,7 @@ func replaySectionsFor(history []provider.Message, width int, renderer *mdRender
 				continue
 			}
 			content := control.StripComposePrefixes(m.Content)
-			out = append(out, renderUserBubble(content, width, false)+"\n\n")
+			out = append(out, renderUserBubble(content, width, control.CollabNormal)+"\n\n")
 		case provider.RoleAssistant:
 			body := strings.TrimSpace(m.Content)
 			if body == "" {
@@ -3825,11 +3951,14 @@ func wrapForViewport(text string, width int, fg cliColor) string {
 // renderUserBubble renders the just-submitted prompt as a transcript line. Keep
 // it visually lighter than the real bottom composer so a fresh session does not
 // look like it has a second input box in the transcript.
-func renderUserBubble(line string, width int, planMode bool) string {
+func renderUserBubble(line string, width int, collabMode string) string {
 	line = displayLineForImageRefs(line)
 	prefix := "› "
-	if planMode {
+	switch collabMode {
+	case control.CollabPlan:
 		prefix = "› [plan] "
+	case control.CollabAsk:
+		prefix = "› [ask] "
 	}
 	if !colorEnabled {
 		return "│ " + prefix + line

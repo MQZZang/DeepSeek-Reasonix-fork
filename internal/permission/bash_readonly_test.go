@@ -93,8 +93,8 @@ func TestIsReadOnlyBashSubject(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.cmd, func(t *testing.T) {
-			if got := isReadOnlyBashSubject(tt.cmd); got != tt.want {
-				t.Errorf("isReadOnlyBashSubject(%q) = %v, want %v", tt.cmd, got, tt.want)
+			if got := IsReadOnlyBashSubject(tt.cmd); got != tt.want {
+				t.Errorf("IsReadOnlyBashSubject(%q) = %v, want %v", tt.cmd, got, tt.want)
 			}
 		})
 	}

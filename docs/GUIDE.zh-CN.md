@@ -77,7 +77,7 @@ command = "reasonix-plugin-example"
 ## 模式快捷键速查
 
 这里按使用端来写，因为用户通常是先知道“我现在在桌面端/CLI”，再找对应按键。
-核心规则很小：`Shift+Tab` 只管 Plan，`Ctrl/Cmd+Y` 只管 YOLO，粘贴继续走系统粘贴快捷键。
+核心规则很小：`Shift+Tab` 只管协作轴（Plan，CLI 里还有只答不改的 Ask），`Ctrl/Cmd+Y` 只管 YOLO，粘贴继续走系统粘贴快捷键。
 
 ### 桌面端 GUI
 
@@ -94,13 +94,14 @@ command = "reasonix-plugin-example"
 
 | 按键或命令 | 作用 | 说明 |
 | --- | --- | --- |
-| `Shift+Tab` | 切换 Plan 开/关 | Plan 是只读规划，不会循环 Ask/Auto/YOLO。 |
+| `Shift+Tab` | 循环 普通 → Plan → Ask（只答不改）→ 普通 | Plan 与 Ask 都是只读协作模式；循环不会触碰 Ask/Auto/YOLO 审批姿态。 |
 | `Ctrl+Y` | 切换 YOLO 开/关 | 关闭 YOLO 时会尽量恢复之前的 Ask/Auto 基底。终端若能转发 Command/Super，也可能识别 `Cmd+Y`，但稳定可用的是 `Ctrl+Y`。 |
 | `--yolo`、`--dangerously-skip-permissions` | 启动时进入 YOLO | 和 `Ctrl+Y` 是同一个运行时模式。 |
 | Ask / Auto | 没有键盘循环 | Ask 是默认交互基底；Auto 不通过 `Shift+Tab` 进入，需要由暴露工具审批姿态的客户端或 API 直接设置。 |
 | `Ctrl+V` | 粘贴剪贴板内容 | CLI 会先尝试剪贴板图片，失败后再按文本粘贴。 |
 | `/paste-image` | 粘贴剪贴板图片 | 适合只想贴图片，或终端应用自己接管文本粘贴的场景。 |
-| `/goal <目标>`、`/goal status`、`/goal clear` | 启动、查看或清除 Goal | Goal 不进入任何快捷键循环。 |
+| `/goal <目标>`、`/goal status`、`/goal pause`、`/goal resume`、`/goal clear` | 启动、查看、暂停/恢复或清除 Goal | Goal 不进入任何快捷键循环。启动 Goal 会离开 Plan/Ask。连续两轮回复缺少 `[goal:*]` 标记会自动暂停；取消回合是暂停而非丢弃。目标可跨重启存续：恢复会话时目标以暂停态回来。 |
+| `/ask`、`/ask <问题>`、`/ask off` | 进入只答不改的问答模式、直接提问、退出 | 只读：写类工具会被 harness 拒绝，回答结束不弹任何审批。 |
 
 `[ui].shortcut_layout` 仍被接受以兼容旧配置，但上面的快捷键行为已经跨布局统一。
 
@@ -112,7 +113,7 @@ command = "reasonix-plugin-example"
 | Auto | 自动放行兜底审批；显式 `ask` / `deny` 规则仍生效。 |
 | YOLO | 跳过普通工具审批；`deny`、用户 `ask` 问题、计划批准提示仍会等待。 |
 | Plan | 下一轮保持只读规划，直到计划被批准或关闭 Plan。 |
-| Goal | 持续追一个已保存目标，直到完成、阻塞或清除。 |
+| Goal | 持续追一个已保存目标，直到完成、阻塞、暂停或清除；暂停的目标用 `/goal resume` 继续。 |
 
 ## 权限与沙盒
 
@@ -238,7 +239,12 @@ Subagent skills 默认继承执行器模型。设置 `subagent_model` 可让它�
 
 交互式前端中，计划模式默认手动开启。设置 `agent.auto_plan = "on"` 后，看起来复杂
 的任务会自动进入 plan mode：Reasonix 先只读生成计划，待用户批准后才
-编辑文件或执行有副作用的命令。`auto_plan_classifier` 可以指定便宜的 provider，例如
+编辑文件或执行有副作用的命令。计划审批是三选一：批准执行（chat 里按 `y`/Enter）、
+提修改意见（按 `e` 后描述想改什么，模型会在同一轮内修订并重新提交）、或拒绝继续
+规划（`n`/Esc）。批准的同时会落一个 `plan-approved: <标题>` 检查点，`/rewind`
+可以一跳回到动手前。批准覆盖的是计划内的文件修改：执行回合中，文件编辑工具不再
+逐个弹确认（每次编辑仍会快照进该检查点），而 shell 命令等其他副作用工具照常弹出
+审批。`auto_plan_classifier` 可以指定便宜的 provider，例如
 `deepseek-flash`；它只在边界输入上调用，分类失败会回退到启发式规则。也可以用
 `reasonix chat` 里的 `/auto-plan off|on` 修改用户级设置，或在 shell/脚本里用
 `reasonix config auto-plan off|on`。只有明确想写项目级覆盖时，才给 shell 命令加

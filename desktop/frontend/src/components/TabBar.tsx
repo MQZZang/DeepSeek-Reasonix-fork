@@ -191,11 +191,13 @@ export function TabBar({ tabs, activeTabId, onTabChange, onTabClose, onTabsClose
           const mode = tabMode(tab);
           const collaborationMode = normalizeCollaborationMode(tab.collaborationMode, tab.goal, mode);
           const planMode = collaborationMode === "plan";
+          const askMode = collaborationMode === "ask";
           const goalMode = collaborationMode === "goal";
           const toolApprovalMode = normalizeToolApprovalMode(tab.toolApprovalMode, mode);
           const stateTitle = [
             tab.running ? "Running" : "",
             planMode ? "Plan" : "",
+            askMode ? "Ask" : "",
             goalMode ? "Goal" : "",
             toolApprovalMode === "auto" ? "Auto approve" : "",
             toolApprovalMode === "yolo" ? "YOLO approval" : "",

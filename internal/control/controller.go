@@ -121,28 +121,43 @@ type Controller struct {
 
 	// mu guards the run state and approval bookkeeping; every critical section
 	// under it is short and non-blocking.
-	mu          sync.Mutex
-	cancel      context.CancelFunc
-	running     bool
-	autosaveWG  sync.WaitGroup
-	planMode    bool
-	goal        string
-	goalStatus  string
-	goalTurns   int
-	goalBlocks  int
-	goalBlock   string
-	sessionPath string
+	mu         sync.Mutex
+	cancel     context.CancelFunc
+	running    bool
+	autosaveWG sync.WaitGroup
+	// collabMode is the collaboration (intent) axis: CollabNormal, CollabPlan,
+	// or CollabAsk; "" reads as normal. Plan and ask both put the executor
+	// under the read-only capability ceiling; only plan gates the turn's reply
+	// behind the plan approval.
+	collabMode string
+	// Goal-mode state. goalMarkerless counts consecutive goal-loop replies
+	// missing the [goal:*] status marker; two in a row pause the goal instead
+	// of silently burning turns. All of it round-trips through the session's
+	// branch-meta sidecar (persistGoal / restoreGoalFromMeta) so an in-flight
+	// goal survives restart/resume.
+	goal           string
+	goalStatus     string
+	goalTurns      int
+	goalBlocks     int
+	goalBlock      string
+	goalMarkerless int
+	sessionPath    string
 	approvals   map[string]pendingApproval
 	asks        map[string]pendingAsk
 	granted     map[string]bool
 	nextID      int
 	// turn counts model turns this session, passed to hooks in their payload.
 	turn int
-	// approvedPlanAutoApproveTools auto-allows writer tool calls without prompting.
-	// Set only while executing a just-approved plan: approving the plan is the
-	// go-ahead, so the model shouldn't re-prompt for every write of the work it
-	// just got cleared to do. Deny rules still bite (those never reach the
-	// approver). Reset when the execution turn returns.
+	// approvedPlanAutoApproveTools auto-allows previewable file-writer tool
+	// calls without prompting. Set only while executing a just-approved plan:
+	// approving the plan is the go-ahead, so the model shouldn't re-prompt for
+	// every file write of the work it just got cleared to do. The waiver covers
+	// exactly the tools whose changes are previewed and snapshotted into the
+	// plan-approved checkpoint (tool.Previewer) — every waived write is
+	// rewindable. bash, MCP tools, and other unpreviewable side effects keep
+	// their normal approval flow even inside the window (risk-5); see
+	// planWindowWaivesLocked. Deny rules still bite (those never reach the
+	// approver). Reset when the execution turn returns, on every path.
 	approvedPlanAutoApproveTools bool
 
 	// toolApprovalMode is the runtime approval posture for permission-gated tool
@@ -174,6 +189,11 @@ type approvalReply struct {
 	allow   bool
 	session bool
 	persist bool // true = write "always allow" rule to config
+	// feedback carries the user's "request changes" text for a plan approval
+	// answered via RevisePlan: the plan is not approved, plan mode stays on,
+	// and the gate hands the text back to the model to revise and resubmit
+	// within the same turn. Ignored for tool approvals.
+	feedback string
 }
 
 type pendingApproval struct {
@@ -465,14 +485,21 @@ const planApprovalTool = "exit_plan_mode"
 const planApprovedMessage = "Plan approved — plan mode is off; you’re cleared to make the changes without asking again. Implement the plan now. Use this serial workflow: 1) mark the first sub-step in_progress with todo_write (this establishes the task list); 2) execute the sub-step; 3) call complete_step with evidence — the host then marks that sub-step completed and moves the next one to in_progress for you. Repeat 2–3 for each remaining sub-step. You don’t need another todo_write to mark steps completed; each complete_step advances the list. Sign off one sub-step at a time — never batch multiple completions."
 
 // runTurn runs one model turn, then applies the plan-approval gate. This is the
-// single, frontend-agnostic plan flow: in plan mode the model just researches
-// (writers are blocked) and writes its plan as a normal answer — no special tool.
-// When the turn ends with a text proposal, the controller asks the user to
-// approve (reusing the ApprovalRequest channel both frontends already render);
-// on approval it exits plan mode, seeds the task list from the plan, and
-// continues straight into execution; on rejection it stays in plan mode so the
-// next turn can revise. Plan mode is only ever set interactively, so the headless
-// `Run` path (which doesn't call this) never blocks on a prompt.
+// single, frontend-agnostic plan flow: in plan mode the model researches
+// (writers are blocked) and proposes its plan by calling the submit_plan tool
+// with a structured title + phases payload, presenting the same plan as its
+// text reply. When the turn ends with a submission, the controller persists a
+// draft artifact and asks the user to approve (reusing the ApprovalRequest
+// channel both frontends already render). The answer is three-way: approval
+// exits plan mode, opens a "plan-approved: <title>" checkpoint, seeds the task
+// list from the structured submission, and continues straight into execution;
+// rejection stays in plan mode so the next turn can revise; "request changes"
+// (RevisePlan) hands the user's feedback back to the model, which revises and
+// resubmits within the same turn for a fresh gate. A reply without a
+// submission is conversation — answered questions never raise the gate (a
+// plan-shaped reply gets one synthetic nudge to submit). Plan mode is only
+// ever set interactively, so the headless `Run` path (which doesn't call
+// this) never blocks on a prompt.
 func (c *Controller) runTurn(ctx context.Context, input string) error {
 	return c.runGoalLoopWithRaw(ctx, input, input)
 }
@@ -514,7 +541,9 @@ func (c *Controller) runGoalLoopWithRaw(ctx context.Context, input, raw string) 
 func (c *Controller) runGoalLoopWithRawDisplay(ctx context.Context, input, raw, display string) error {
 	if err := c.runTurnWithRawDisplay(ctx, input, raw, display); err != nil {
 		if ctx.Err() != nil {
-			c.stopGoal(GoalStatusStopped)
+			// Cancellation suspends rather than kills the goal: the objective
+			// text is kept and /goal resume continues where it left off.
+			c.stopGoal(GoalStatusPaused)
 		}
 		return err
 	}
@@ -548,42 +577,107 @@ func (c *Controller) runTurnWithRawDisplay(ctx context.Context, input, raw, disp
 	if err := c.runner.Run(ctx, input); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	plan := c.planMode
-	c.mu.Unlock()
-	if !plan {
+	// Only plan mode gates the reply behind an approval; ask mode answers and
+	// stops, normal mode has nothing to gate.
+	if c.CollaborationMode() != CollabPlan {
 		return nil
 	}
-	proposal := lastAssistantText(c.History())
-	if proposal == "" {
-		return nil // no substantive proposal to gate
-	}
-	// The plan is already visible as the assistant's answer, so the request
-	// carries no subject — it's purely the gate.
-	allow, _, err := c.requestApproval(ctx, planApprovalTool, "")
-	if err != nil {
-		return err
-	}
-	if !allow {
-		return nil // keep planning; plan mode stays on
-	}
-	c.SetPlanMode(false)
-	seededTodos := c.seedPlanTodos(proposal)
-	// The plan is the go-ahead: don't re-prompt for each write of the approved
-	// work. Auto-approve writers for the duration of this execution turn only.
-	c.mu.Lock()
-	c.approvedPlanAutoApproveTools = true
-	c.mu.Unlock()
-	defer func() {
+	// The gate is a loop because the approval has three answers: approve
+	// executes, reject ends the turn (plan mode stays on), and "request
+	// changes" hands the user's feedback back to the model, which revises and
+	// resubmits — landing back at the top for a fresh gate on the new plan.
+	// Each iteration costs one explicit user decision, so the loop is bounded
+	// by the user, never by the model.
+	subStart := startMessages
+	for {
+		sub, submitted, err := c.resolvePlanSubmission(ctx, subStart)
+		if err != nil {
+			return err
+		}
+		if !submitted {
+			return nil // Q&A or declined nudge: nothing to gate, keep planning
+		}
+		// Persist the proposal as a draft artifact before the gate so the user can
+		// inspect the exact structured plan they are approving. Best-effort: ""
+		// (no workspace root / write failure) changes nothing downstream.
+		artifact := c.writePlanArtifact(sub)
+		if artifact != "" {
+			c.notice(fmt.Sprintf(i18n.M.PlanArtifactSavedFmt, artifact))
+		}
+		// The plan is already visible as the assistant's answer, so the request
+		// carries no subject — it's purely the gate.
+		r, err := c.requestApprovalReply(ctx, planApprovalTool, "")
+		if err != nil {
+			return err
+		}
+		if !r.allow {
+			setPlanArtifactStatus(artifact, planStatusRejected)
+			feedback := strings.TrimSpace(r.feedback)
+			if feedback == "" {
+				return nil // plain rejection: keep planning, plan mode stays on
+			}
+			// Revision sub-turn: only submissions made after this point count,
+			// so a model that ignores the feedback cannot re-raise the gate
+			// with the already-rejected plan.
+			subStart = len(c.History())
+			if err := c.runner.Run(ctx, planReviseMessage+feedback); err != nil {
+				return err
+			}
+			continue
+		}
+		setPlanArtifactStatus(artifact, planStatusApproved)
+		// A labeled checkpoint right at the approve/execute boundary: the rewind
+		// picker shows "plan-approved: <title>" and jumping there restores the
+		// world to just before the agent started touching files, with the plan
+		// discussion intact. Execution pre-edit snapshots land in it.
+		c.beginCheckpoint(planApprovedCheckpointPrefix + sub.Title)
+		c.SetPlanMode(false)
+		seededTodos := c.seedPlanTodosArgs(planTodosArgsFromSubmission(sub))
+		// The plan is the go-ahead: don't re-prompt for each file write of the
+		// approved work. The waiver lasts this execution turn only and covers
+		// only previewable writers (planWindowWaivesLocked) — bash and other
+		// unpreviewable side effects still prompt.
 		c.mu.Lock()
-		c.approvedPlanAutoApproveTools = false
+		c.approvedPlanAutoApproveTools = true
 		c.mu.Unlock()
-	}()
-	if err := c.runner.Run(ctx, planApprovedMessage); err != nil {
-		return err
+		defer func() {
+			c.mu.Lock()
+			c.approvedPlanAutoApproveTools = false
+			c.mu.Unlock()
+		}()
+		if err := c.runner.Run(ctx, planApprovedMessage); err != nil {
+			return err
+		}
+		c.completePlanTodos(seededTodos)
+		setPlanArtifactStatus(artifact, planStatusExecuted)
+		return nil
 	}
-	c.completePlanTodos(seededTodos)
-	return nil
+}
+
+// resolvePlanSubmission finds the submit_plan call made at or after message
+// index `from`. The gate keys on an explicit submit_plan call, not on the
+// reply text: a plain answer in plan mode is conversation, not a proposal
+// (Gate-2 case A3). When the reply LOOKS like a plan (markdown list items)
+// but the model skipped submit_plan, it nudges once — the model is the only
+// one who knows whether its text was a plan — and trusts the second answer.
+// The error is non-nil only when the nudge sub-turn itself failed.
+func (c *Controller) resolvePlanSubmission(ctx context.Context, from int) (PlanSubmission, bool, error) {
+	sub, submitted := c.planSubmissionFromTurn(from)
+	if submitted {
+		return sub, true, nil
+	}
+	proposal := lastAssistantText(c.History())
+	if proposal == "" || len(parsePlanTodos(proposal)) == 0 {
+		return PlanSubmission{}, false, nil // Q&A or empty reply
+	}
+	if err := c.runner.Run(ctx, planSubmitNudgeMessage); err != nil {
+		return PlanSubmission{}, false, err
+	}
+	if sub, submitted = c.planSubmissionFromTurn(from); !submitted {
+		c.notice(i18n.M.PlanNudgeDeclined)
+		return PlanSubmission{}, false, nil // the model says it wasn't a plan
+	}
+	return sub, true, nil
 }
 
 func (c *Controller) continueGoal(ctx context.Context) error {
@@ -593,12 +687,12 @@ func (c *Controller) continueGoal(ctx context.Context) error {
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
-			c.stopGoal(GoalStatusStopped)
+			c.stopGoal(GoalStatusPaused)
 			return err
 		}
 		if err := c.runTurnWithRawDisplay(ctx, goalContinueTurn, goalContinueTurn, ""); err != nil {
 			if ctx.Err() != nil {
-				c.stopGoal(GoalStatusStopped)
+				c.stopGoal(GoalStatusPaused)
 			}
 			return err
 		}
@@ -607,7 +701,7 @@ func (c *Controller) continueGoal(ctx context.Context) error {
 
 func (c *Controller) advanceGoalAfterTurn() bool {
 	reply := lastAssistantText(c.History())
-	status, reason, _ := parseGoalStatusMarker(reply)
+	status, reason, marked := parseGoalStatusMarker(reply)
 	var notice string
 	c.mu.Lock()
 	if strings.TrimSpace(c.goal) == "" || c.goalStatus != GoalStatusRunning {
@@ -615,12 +709,25 @@ func (c *Controller) advanceGoalAfterTurn() bool {
 		return false
 	}
 	c.goalTurns++
+	if marked {
+		c.goalMarkerless = 0
+	} else {
+		// No [goal:*] marker: the model is drifting from the goal contract.
+		// One slip continues (models do forget once); two in a row pause the
+		// goal and hand control back instead of silently burning turns (F2).
+		c.goalMarkerless++
+		if c.goalMarkerless >= 2 {
+			c.goalStatus = GoalStatusPaused
+			notice = i18n.M.GoalPausedMarkerless
+		}
+	}
 	switch status {
 	case GoalStatusComplete:
 		c.goal = ""
 		c.goalStatus = GoalStatusComplete
 		c.goalBlocks = 0
 		c.goalBlock = ""
+		c.goalMarkerless = 0
 		notice = "goal complete"
 	case GoalStatusBlocked:
 		reason = cleanGoalBlockReason(reason)
@@ -648,6 +755,7 @@ func (c *Controller) advanceGoalAfterTurn() bool {
 	}
 	cont := notice == ""
 	c.mu.Unlock()
+	c.persistGoal()
 	if notice != "" {
 		c.notice(notice)
 	}
@@ -706,10 +814,14 @@ func normalizeGoalBlockReason(reason string) string {
 
 func (c *Controller) stopGoal(status string) {
 	c.mu.Lock()
-	if strings.TrimSpace(c.goal) != "" && c.goalStatus == GoalStatusRunning {
+	changed := strings.TrimSpace(c.goal) != "" && c.goalStatus == GoalStatusRunning
+	if changed {
 		c.goalStatus = status
 	}
 	c.mu.Unlock()
+	if changed {
+		c.persistGoal()
+	}
 }
 
 // lastAssistantText returns the content of the most recent assistant message with
@@ -753,6 +865,9 @@ func (c *Controller) submit(input, display string) {
 		return
 	}
 	if c.applyGoalCommand(trimmed, display) {
+		return
+	}
+	if c.applyAskCommand(trimmed, display) {
 		return
 	}
 	if strings.HasPrefix(trimmed, "!") {
@@ -899,7 +1014,8 @@ func (c *Controller) applyGoalCommand(input, display string) bool {
 	}
 	switch cmd.Action {
 	case GoalCommandSet:
-		c.SetPlanMode(false)
+		// A goal is execution work: leave plan or ask mode for the full ceiling.
+		c.SetCollaborationMode(CollabNormal)
 		c.SetGoal(cmd.Text)
 		c.notice(fmt.Sprintf(i18n.M.GoalSetFmt, ShortGoalForNotice(cmd.Text)))
 		if c.runner != nil {
@@ -910,12 +1026,58 @@ func (c *Controller) applyGoalCommand(input, display string) bool {
 	case GoalCommandClear:
 		c.ClearGoal()
 		c.notice(i18n.M.GoalCleared)
+	case GoalCommandPause:
+		if c.PauseGoal() {
+			c.notice(i18n.M.GoalPaused)
+		} else {
+			c.notice(i18n.M.GoalNothingToPause)
+		}
+	case GoalCommandResume:
+		if !c.ResumeGoal() {
+			c.notice(i18n.M.GoalNothingToResume)
+			return true
+		}
+		c.notice(fmt.Sprintf(i18n.M.GoalResumedFmt, ShortGoalForNotice(c.Goal())))
+		if c.runner != nil {
+			c.runGuarded(func(ctx context.Context) error {
+				return c.runGoalLoopWithRawDisplay(ctx, goalContinueTurn, goalContinueTurn, display)
+			})
+		}
 	default:
 		goal := c.Goal()
 		if strings.TrimSpace(goal) == "" {
 			c.notice(i18n.M.GoalEmpty)
+		} else if status := c.GoalStatus(); status != GoalStatusRunning {
+			c.notice(fmt.Sprintf(i18n.M.GoalCurrentStatusFmt, status, goal))
 		} else {
 			c.notice(fmt.Sprintf(i18n.M.GoalCurrentFmt, goal))
+		}
+	}
+	return true
+}
+
+// applyAskCommand handles the "/ask" family: bare "/ask" enters ask mode,
+// "/ask off" leaves it, "/ask <question>" enters it and runs the question as a
+// normal reference-resolved turn (the ask marker rides in via Compose).
+func (c *Controller) applyAskCommand(input, display string) bool {
+	cmd, ok := ParseAskCommand(input)
+	if !ok {
+		return false
+	}
+	switch cmd.Action {
+	case AskCommandOn:
+		c.SetCollaborationMode(CollabAsk)
+		c.notice(i18n.M.AskModeOn)
+	case AskCommandOff:
+		if c.CollaborationMode() == CollabAsk {
+			c.SetCollaborationMode(CollabNormal)
+		}
+		c.notice(i18n.M.AskModeOff)
+	case AskCommandQuestion:
+		c.SetCollaborationMode(CollabAsk)
+		c.notice(i18n.M.AskModeOn)
+		if c.runner != nil {
+			c.runRefTurn(cmd.Text, display)
 		}
 	}
 	return true
@@ -1108,6 +1270,26 @@ func (c *Controller) Approve(id string, allow, session, persist bool) {
 	}
 }
 
+// RevisePlan answers a pending plan ApprovalRequest by ID with "request
+// changes": the plan is not approved, plan mode stays on, and the feedback
+// text is handed back to the model, which revises and resubmits within the
+// same turn — the third option next to approve and reject. On a non-plan
+// approval (misrouted ID) it degrades to a plain deny; the feedback is
+// ignored. Unknown/expired IDs are ignored.
+func (c *Controller) RevisePlan(id, feedback string) {
+	c.mu.Lock()
+	pending := c.approvals[id]
+	delete(c.approvals, id)
+	c.mu.Unlock()
+	if pending.reply == nil {
+		return
+	}
+	if pending.tool != planApprovalTool {
+		feedback = ""
+	}
+	pending.reply <- approvalReply{allow: false, feedback: feedback} // buffered, never blocks
+}
+
 // EnableInteractiveApproval swaps the executor's gate for one that routes
 // approval decisions to the frontend via ApprovalRequest events, and wires the
 // controller in as the executor's Asker so the `ask` tool can question the user.
@@ -1258,15 +1440,44 @@ func (c *Controller) ReplayPendingPrompts() {
 	}
 }
 
-// SetPlanMode flips the executor's read-only gate without touching the
-// cache-stable prompt prefix, and remembers the state so Compose can prepend the
-// plan-mode marker to outgoing turns.
-func (c *Controller) SetPlanMode(v bool) {
+// SetCollaborationMode sets the collaboration (intent) axis and applies the
+// matching capability ceiling to the executor: plan and ask run read-only,
+// normal runs full. The cache-stable prompt prefix is never touched — Compose
+// prepends the mode's marker to outgoing turns instead.
+func (c *Controller) SetCollaborationMode(mode string) {
+	mode = NormalizeCollaborationMode(mode)
 	c.mu.Lock()
-	c.planMode = v
+	c.collabMode = mode
 	c.mu.Unlock()
 	if c.executor != nil {
-		c.executor.SetPlanMode(v)
+		if mode == CollabNormal {
+			c.executor.SetCeiling(agent.CeilingFull)
+		} else {
+			c.executor.SetCeiling(agent.CeilingReadOnly)
+		}
+	}
+}
+
+// CollaborationMode reports the current collaboration axis (normal/plan/ask).
+func (c *Controller) CollaborationMode() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.collabMode == "" {
+		return CollabNormal
+	}
+	return c.collabMode
+}
+
+// SetPlanMode is the boolean compatibility shim over SetCollaborationMode:
+// true enters plan mode; false exits plan mode (it deliberately does not touch
+// ask mode — frontends that mean "set the axis" call SetCollaborationMode).
+func (c *Controller) SetPlanMode(v bool) {
+	if v {
+		c.SetCollaborationMode(CollabPlan)
+		return
+	}
+	if c.CollaborationMode() == CollabPlan {
+		c.SetCollaborationMode(CollabNormal)
 	}
 }
 
@@ -1280,27 +1491,29 @@ func (c *Controller) SetAutoPlan(mode string) {
 // PlanMode reports whether outgoing turns currently receive the plan-mode
 // marker. Frontends use it after Compose because auto-plan may flip the mode.
 func (c *Controller) PlanMode() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.planMode
+	return c.CollaborationMode() == CollabPlan
 }
 
 // SetGoal stores a session-scoped active goal. Compose injects it into outgoing
 // user turns, not the system prompt or tool schema, so it does not disturb the
-// cache-stable prefix.
+// cache-stable prefix. The new state is mirrored into the session's branch-meta
+// sidecar so the goal survives restart/resume.
 func (c *Controller) SetGoal(goal string) {
 	goal = strings.TrimSpace(goal)
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if goal == "" {
 		c.goal = ""
 		c.goalStatus = GoalStatusStopped
 		c.goalTurns = 0
 		c.goalBlocks = 0
 		c.goalBlock = ""
+		c.goalMarkerless = 0
+		c.mu.Unlock()
+		c.persistGoal()
 		return
 	}
 	if c.goal == goal && c.goalStatus == GoalStatusRunning {
+		c.mu.Unlock()
 		return
 	}
 	c.goal = goal
@@ -1308,10 +1521,136 @@ func (c *Controller) SetGoal(goal string) {
 	c.goalTurns = 0
 	c.goalBlocks = 0
 	c.goalBlock = ""
+	c.goalMarkerless = 0
+	c.mu.Unlock()
+	c.persistGoal()
 }
 
 func (c *Controller) ClearGoal() {
 	c.SetGoal("")
+}
+
+// PauseGoal suspends a running goal, keeping the objective text so the loop
+// can be resumed later. Mid-turn it takes effect at the next loop boundary
+// (advanceGoalAfterTurn stops continuing once the status leaves running).
+// Reports whether there was a running goal to pause.
+func (c *Controller) PauseGoal() bool {
+	c.mu.Lock()
+	ok := strings.TrimSpace(c.goal) != "" && c.goalStatus == GoalStatusRunning
+	if ok {
+		c.goalStatus = GoalStatusPaused
+	}
+	c.mu.Unlock()
+	if ok {
+		c.persistGoal()
+	}
+	return ok
+}
+
+// ResumeGoal moves a paused or blocked goal back to running with a fresh
+// blocked/markerless audit, reporting whether there was anything to resume.
+// The caller restarts the goal loop.
+func (c *Controller) ResumeGoal() bool {
+	c.mu.Lock()
+	ok := strings.TrimSpace(c.goal) != "" &&
+		(c.goalStatus == GoalStatusPaused || c.goalStatus == GoalStatusBlocked)
+	if ok {
+		c.goalStatus = GoalStatusRunning
+		c.goalBlocks = 0
+		c.goalBlock = ""
+		c.goalMarkerless = 0
+	}
+	c.mu.Unlock()
+	if ok {
+		c.persistGoal()
+	}
+	return ok
+}
+
+// persistGoal mirrors the in-memory goal state into the session's branch-meta
+// sidecar (creating it if needed). Completed/cleared goals remove the record.
+// Persistence-disabled sessions (empty path) skip silently; failures are
+// logged, never fatal — the goal still works for the life of the process.
+func (c *Controller) persistGoal() {
+	c.mu.Lock()
+	path := c.sessionPath
+	state := agent.GoalState{
+		Text:       c.goal,
+		Status:     c.goalStatus,
+		Turns:      c.goalTurns,
+		Blocks:     c.goalBlocks,
+		Block:      c.goalBlock,
+		Markerless: c.goalMarkerless,
+	}
+	c.mu.Unlock()
+	if path == "" {
+		return
+	}
+	keep := strings.TrimSpace(state.Text) != "" &&
+		(state.Status == GoalStatusRunning || state.Status == GoalStatusPaused || state.Status == GoalStatusBlocked)
+	if !keep {
+		// Clearing must not create sidecar files as a side effect (a cleared
+		// goal on a fresh session would otherwise mint an empty meta): only
+		// rewrite a meta that exists and actually stores a goal.
+		m, ok, err := agent.LoadBranchMeta(path)
+		if err != nil || !ok || m.Goal == nil {
+			return
+		}
+		m.Goal = nil
+		if err := agent.SaveBranchMetaPreserveUpdated(path, m); err != nil {
+			slog.Warn("controller: persist goal", "err", err)
+		}
+		return
+	}
+	m, err := agent.EnsureBranchMeta(path)
+	if err != nil {
+		slog.Warn("controller: persist goal", "err", err)
+		return
+	}
+	m.Goal = &state
+	if err := agent.SaveBranchMetaPreserveUpdated(path, m); err != nil {
+		slog.Warn("controller: persist goal", "err", err)
+	}
+}
+
+// restoreGoalFromMeta loads the goal recorded in the session's sidecar, if
+// any, into the controller. A goal that was running when the session went away
+// comes back paused — there is no loop to drive it, and silently resuming
+// autonomous work on resume would be a surprise; /goal resume continues it.
+// A session without a stored goal clears any goal carried over from the
+// previously attached session.
+func (c *Controller) restoreGoalFromMeta(path string) {
+	var state *agent.GoalState
+	if path != "" {
+		if m, ok, err := agent.LoadBranchMeta(path); err == nil && ok {
+			state = m.Goal
+		}
+	}
+	c.mu.Lock()
+	if state == nil || strings.TrimSpace(state.Text) == "" {
+		c.goal = ""
+		c.goalStatus = ""
+		c.goalTurns = 0
+		c.goalBlocks = 0
+		c.goalBlock = ""
+		c.goalMarkerless = 0
+		c.mu.Unlock()
+		return
+	}
+	c.goal = state.Text
+	switch state.Status {
+	case GoalStatusBlocked:
+		c.goalStatus = GoalStatusBlocked
+	default: // running or paused → paused
+		c.goalStatus = GoalStatusPaused
+	}
+	c.goalTurns = state.Turns
+	c.goalBlocks = state.Blocks
+	c.goalBlock = state.Block
+	c.goalMarkerless = state.Markerless
+	goal := c.goal
+	c.mu.Unlock()
+	c.notice(fmt.Sprintf(i18n.M.GoalRestoredFmt, ShortGoalForNotice(goal)))
 }
 
 func (c *Controller) Goal() string {
@@ -1373,6 +1712,9 @@ func (c *Controller) NewSession() error {
 	}
 	c.executor.SetSession(agent.NewSession(c.systemPrompt))
 	c.rebindCheckpoints(c.SessionPath())
+	// A goal is session-scoped: it must not leak into (or pollute the sidecar
+	// of) the fresh session.
+	c.ClearGoal()
 	c.mu.Lock()
 	c.startedOnce = true // NewSession fires SessionStart itself; don't re-fire on the next turn
 	c.mu.Unlock()
@@ -1404,6 +1746,7 @@ func (c *Controller) ClearSession() error {
 	}
 	c.executor.SetSession(agent.NewSession(c.systemPrompt))
 	c.rebindCheckpoints(c.SessionPath())
+	c.ClearGoal() // session-scoped: do not leak into the fresh session
 	c.mu.Lock()
 	c.startedOnce = true
 	c.mu.Unlock()
@@ -1775,7 +2118,9 @@ func (c *Controller) summarizeAt(ctx context.Context, turn int, from bool) error
 }
 
 // Resume seeds the session from a loaded transcript and pins the active file to
-// its path so auto-save keeps appending there.
+// its path so auto-save keeps appending there. Any goal recorded in the
+// session's sidecar is restored (paused); a session without one clears any
+// goal carried over from the previously attached session.
 func (c *Controller) Resume(s *agent.Session, path string) {
 	if c.executor != nil {
 		c.executor.SetSession(s)
@@ -1784,6 +2129,7 @@ func (c *Controller) Resume(s *agent.Session, path string) {
 	c.sessionPath = path
 	c.mu.Unlock()
 	c.rebindCheckpoints(path)
+	c.restoreGoalFromMeta(path)
 	c.maybeColdResumePrune(path)
 }
 
@@ -2404,14 +2750,14 @@ func (c *Controller) SetBypass(on bool) {
 
 // SetMode applies plan (read-only) and tool auto-approval together so a turn
 // submitted right after a composer mode switch can't observe a half-applied
-// gate. Turning tool auto-approval on drains any pending tool approval.
+// gate. Turning tool auto-approval on drains any pending tool approval. As an
+// explicit axes set, it always lands on plan or normal (leaving ask requires
+// no special case: plan=false sets normal).
 func (c *Controller) SetMode(plan, autoApproveTools bool) {
-	c.mu.Lock()
-	c.planMode = plan
-	c.mu.Unlock()
-
-	if c.executor != nil {
-		c.executor.SetPlanMode(plan)
+	if plan {
+		c.SetCollaborationMode(CollabPlan)
+	} else {
+		c.SetCollaborationMode(CollabNormal)
 	}
 	if autoApproveTools {
 		c.SetToolApprovalMode(ToolApprovalYolo)
@@ -2575,8 +2921,9 @@ type gateApprover struct{ c *Controller }
 
 func (g gateApprover) Approve(ctx context.Context, tool, subject string, args json.RawMessage) (bool, bool, error) {
 	subject = approvalDisplaySubject(tool, subject, args)
-	// Auto-allow without prompting while executing a just-approved plan (the plan
-	// was the approval) or while YOLO/full-access tool auto-approval is on. Deny
+	// Auto-allow without prompting while YOLO/full-access tool auto-approval is
+	// on, or — for previewable file writers only — while executing a
+	// just-approved plan (the plan was the approval for those edits). Deny
 	// rules already bit before this point, so they still block.
 	g.c.mu.Lock()
 	auto := g.c.approvalBypassAllowsLocked(tool)
@@ -2691,13 +3038,15 @@ type seedTodo struct {
 	Level   int    `json:"level,omitempty"`
 }
 
-// seedPlanTodos turns an approved plan into a starter task list and emits it as a
-// synthetic todo_write event, so the live task panel populates the instant the
-// user approves — a structural guarantee, not a prompt the model might ignore.
-// The model still flips item status as it works (only it knows its own
-// progress); this just makes the list exist. No-op when the plan has no list.
-func (c *Controller) seedPlanTodos(plan string) string {
-	args := PlanTodosJSON(plan)
+// seedPlanTodosArgs emits an approved plan's starter task list as a synthetic
+// todo_write event, so the live task panel populates the instant the user
+// approves — a structural guarantee, not a prompt the model might ignore.
+// args is todo_write-shaped JSON, normally built straight from the structured
+// submit_plan submission (planTodosArgsFromSubmission); the markdown path
+// (PlanTodosJSON) remains for callers that only have plan text. The model
+// still flips item status as it works (only it knows its own progress); this
+// just makes the list exist. No-op for empty args.
+func (c *Controller) seedPlanTodosArgs(args string) string {
 	if args == "" {
 		return ""
 	}
@@ -2882,13 +3231,20 @@ func parseRewind(args string, cps []checkpoint.Meta) (int, RewindScope, error) {
 // answers or ctx is cancelled. A prior session grant for the same approval scope
 // short-circuits. promptMu serialises outstanding prompts.
 func (c *Controller) requestApproval(ctx context.Context, tool, subject string) (bool, bool, error) {
+	r, err := c.requestApprovalReply(ctx, tool, subject)
+	return r.allow, false, err
+}
+
+// requestApprovalReply is requestApproval returning the full reply, so the
+// plan gate can read the RevisePlan feedback alongside the verdict.
+func (c *Controller) requestApprovalReply(ctx context.Context, tool, subject string) (approvalReply, error) {
 	c.mu.Lock()
 	// YOLO/full access and the just-approved-plan execution window auto-allow
 	// approval-gated tools without prompting. Plan approval is a user decision,
 	// not a tool permission, so it deliberately stays interactive.
 	if c.approvalBypassAllowsLocked(tool) || c.sessionGrantAllowsLocked(tool, subject) {
 		c.mu.Unlock()
-		return true, false, nil
+		return approvalReply{allow: true}, nil
 	}
 	c.mu.Unlock()
 
@@ -2900,7 +3256,7 @@ func (c *Controller) requestApproval(ctx context.Context, tool, subject string) 
 	c.mu.Lock()
 	if c.approvalBypassAllowsLocked(tool) || c.sessionGrantAllowsLocked(tool, subject) {
 		c.mu.Unlock()
-		return true, false, nil
+		return approvalReply{allow: true}, nil
 	}
 	c.nextID++
 	id := strconv.Itoa(c.nextID)
@@ -2926,12 +3282,12 @@ func (c *Controller) requestApproval(ctx context.Context, tool, subject string) 
 		if r.allow && r.persist && !requiresFreshApprovalTool(tool) && c.onRemember != nil {
 			c.emitRememberResult(c.onRemember(permission.RememberRuleForScope(tool, subject)))
 		}
-		return r.allow, false, nil
+		return r, nil
 	case <-ctx.Done():
 		c.mu.Lock()
 		delete(c.approvals, id)
 		c.mu.Unlock()
-		return false, false, ctx.Err()
+		return approvalReply{}, ctx.Err()
 	}
 }
 
@@ -2945,8 +3301,42 @@ func approvalNotificationText(tool, subject string) string {
 	return "approval needed: " + tool + " " + subject
 }
 
+// approvalBypassAllowsLocked reports whether the current bypass state waives
+// the approval prompt for this tool. YOLO waives everything except the plan
+// gate (the user opted into that posture explicitly); the approved-plan
+// execution window is narrower — it only waives previewable file writers.
 func (c *Controller) approvalBypassAllowsLocked(tool string) bool {
-	return !requiresFreshApprovalTool(tool) && (c.toolApprovalMode == ToolApprovalYolo || c.approvedPlanAutoApproveTools)
+	if requiresFreshApprovalTool(tool) {
+		return false
+	}
+	if c.toolApprovalMode == ToolApprovalYolo {
+		return true
+	}
+	return c.approvedPlanAutoApproveTools && c.planWindowWaivesLocked(tool)
+}
+
+// planWindowWaivesLocked decides which tools the approved-plan execution
+// window auto-allows: non-read-only tools that implement tool.Previewer. That
+// is exactly the set whose changes are previewed and snapshotted into the
+// plan-approved checkpoint before each edit, so every waived write is
+// inspectable and rewindable — approving the plan covers the file edits the
+// plan described. Tools with unknowable side effects (bash, MCP tools, task,
+// kill_shell) keep their normal approval flow inside the window; read-only
+// bash commands never reach the approver anyway (permission.Gate.Check
+// reclassifies them before the policy decision). A read-only tool reaching
+// the approver means an explicit ask rule named it — the window never
+// overrides the user's own rules. With no registry to consult, nothing is
+// waived: the conservative direction.
+func (c *Controller) planWindowWaivesLocked(name string) bool {
+	if c.reg == nil {
+		return false
+	}
+	t, ok := c.reg.Get(name)
+	if !ok || t.ReadOnly() {
+		return false
+	}
+	_, previewable := t.(tool.Previewer)
+	return previewable
 }
 
 func (c *Controller) autoApprovalWouldAllowLocked(tool, subject string) bool {

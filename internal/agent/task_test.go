@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"reasonix/internal/provider"
@@ -314,6 +315,80 @@ func TestTaskToolRejectsMismatchedContinuationProfile(t *testing.T) {
 	_, err = task.Execute(testTaskContext(), []byte(`{"prompt":"second task","continue_from":"`+ref+`","model":"other-model"}`))
 	if err == nil || !strings.Contains(err.Error(), "model/effort") {
 		t.Fatalf("mismatched model error = %v, want compatibility failure", err)
+	}
+}
+
+// TestTaskSubagentInheritsReadOnlyCeiling pins the PR3 security contract: a
+// task spawned while the parent runs under CeilingReadOnly (plan/ask mode)
+// passes that ceiling to its sub-agent, so a writer tool inside the sub-agent
+// is refused by the sub-agent's own harness — admission of the task call does
+// NOT widen what the turn can do. The ceiling travels via the context stamp
+// (executeOne → WithCeiling → CeilingFromContext → Options.Ceiling).
+func TestTaskSubagentInheritsReadOnlyCeiling(t *testing.T) {
+	var writes int32
+	sub := &mockProvider{name: "sub", streams: [][]provider.Chunk{
+		{
+			{Type: provider.ChunkToolCall, ToolCall: &provider.ToolCall{ID: "w1", Name: "write_file", Arguments: `{"path":"main.go"}`}},
+			{Type: provider.ChunkDone},
+		},
+		{
+			{Type: provider.ChunkText, Text: "research done, no writes"},
+			{Type: provider.ChunkDone},
+		},
+	}}
+	parentReg := tool.NewRegistry()
+	parentReg.Add(fakeTool{name: "write_file", readOnly: false, calls: &writes})
+	task := newTestTaskTool(t, sub, parentReg, "sys", "", "", nil)
+
+	// Simulate the parent executeOne stamp for a read-only parent.
+	ctx := WithCeiling(testTaskContext(), CeilingReadOnly)
+	out, err := task.Execute(ctx, []byte(`{"prompt":"survey the failing tests"}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got := atomic.LoadInt32(&writes); got != 0 {
+		t.Fatalf("writer executed %d times inside ceiling-inherited sub-agent, want 0", got)
+	}
+	if !strings.Contains(out, "research done, no writes") {
+		t.Fatalf("out = %q, want the sub-agent final answer", out)
+	}
+	// The sub-agent model must have seen the canonical blocked tool result so
+	// it can adapt instead of silently losing the call.
+	var sawBlocked bool
+	for _, m := range sub.lastReq.Messages {
+		if m.Role == provider.RoleTool && strings.Contains(m.Content, "read-only") {
+			sawBlocked = true
+		}
+	}
+	if !sawBlocked {
+		t.Fatal("sub-agent transcript missing the blocked read-only tool result")
+	}
+}
+
+// TestTaskSubagentFullCeilingStillWrites is the inheritance companion: with no
+// read-only stamp on the context (parent at CeilingFull), the sub-agent's
+// writer runs as before — PR3 must not restrict normal-mode delegation.
+func TestTaskSubagentFullCeilingStillWrites(t *testing.T) {
+	var writes int32
+	sub := &mockProvider{name: "sub", streams: [][]provider.Chunk{
+		{
+			{Type: provider.ChunkToolCall, ToolCall: &provider.ToolCall{ID: "w1", Name: "write_file", Arguments: `{"path":"main.go"}`}},
+			{Type: provider.ChunkDone},
+		},
+		{
+			{Type: provider.ChunkText, Text: "edited"},
+			{Type: provider.ChunkDone},
+		},
+	}}
+	parentReg := tool.NewRegistry()
+	parentReg.Add(fakeTool{name: "write_file", readOnly: false, calls: &writes})
+	task := newTestTaskTool(t, sub, parentReg, "sys", "", "", nil)
+
+	if _, err := task.Execute(testTaskContext(), []byte(`{"prompt":"apply the fix"}`)); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got := atomic.LoadInt32(&writes); got != 1 {
+		t.Fatalf("writer executed %d times under full ceiling, want 1", got)
 	}
 }
 

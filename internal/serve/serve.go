@@ -396,9 +396,18 @@ func (s *Server) approve(w http.ResponseWriter, r *http.Request) {
 		Allow   bool   `json:"allow"`
 		Session bool   `json:"session"`
 		Persist bool   `json:"persist"`
+		// Feedback turns a plan denial into "request changes": the text goes
+		// back to the model, which revises and resubmits within the same turn.
+		// Ignored when allow is true or for non-plan approvals.
+		Feedback string `json:"feedback"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
 		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	if !body.Allow && strings.TrimSpace(body.Feedback) != "" {
+		s.ctl().RevisePlan(body.ID, strings.TrimSpace(body.Feedback))
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	s.ctl().Approve(body.ID, body.Allow, body.Session, body.Persist)
@@ -772,6 +781,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		"label":            s.ctl().Label(),
 		"running":          s.ctl().Running(),
 		"plan":             s.ctl().PlanMode(),
+		"collaboration":    s.ctl().CollaborationMode(),
 		"autoApproveTools": s.ctl().AutoApproveTools(),
 		"bypass":           s.ctl().AutoApproveTools(),
 		"toolApprovalMode": s.ctl().ToolApprovalMode(),

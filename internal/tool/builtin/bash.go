@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"reasonix/internal/jobs"
+	"reasonix/internal/permission"
 	"reasonix/internal/proc"
 	"reasonix/internal/sandbox"
 	"reasonix/internal/tool"
@@ -112,7 +113,31 @@ func (bash) Schema() json.RawMessage {
 // ReadOnly is false: bash's effect cannot be inferred from args (rm, curl,
 // git commit, etc. are all reachable). Conservative even when a particular
 // command happens to be read-only — the agent batch decision can't tell.
+// The agent ceiling check consults IsReadOnlyCommand for per-invocation
+// classification instead of keying on this static flag.
 func (bash) ReadOnly() bool { return false }
+
+// IsReadOnlyCommand satisfies the agent.commandReadOnly optional interface.
+// It returns true when the specific command is classified as read-only by the
+// permission package classifier — the same logic the permission gate uses when
+// deciding whether a bash call needs approval. This lets the agent ceiling check
+// admit read-only diagnostics (git log, grep, go vet, …) under a CeilingReadOnly
+// parent (plan mode, ask mode) without requiring a permission policy override.
+func (bash) IsReadOnlyCommand(args json.RawMessage) bool {
+	var p struct {
+		Command         string `json:"command"`
+		RunInBackground bool   `json:"run_in_background"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return false
+	}
+	// Background jobs run outside the turn and can't be easily traced by the
+	// parent ceiling — classify conservatively so they're blocked under ReadOnly.
+	if p.RunInBackground {
+		return false
+	}
+	return permission.IsReadOnlyBashSubject(p.Command)
+}
 
 func (b bash) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var p struct {

@@ -40,11 +40,14 @@ func (c *Controller) maybeAutoPlan(ctx context.Context, input string) {
 func (c *Controller) shouldAutoPlan(ctx context.Context, input string) bool {
 	c.mu.Lock()
 	mode := c.autoPlan
-	plan := c.planMode
+	collab := c.collabMode
 	goalActive := strings.TrimSpace(c.goal) != "" && c.goalStatus == GoalStatusRunning
 	classifier := c.classifier
 	c.mu.Unlock()
-	if mode == autoPlanOff || plan || goalActive {
+	// Already in plan mode: nothing to do. In ask mode: the user explicitly
+	// asked for an answer-only turn — a complexity heuristic must not override
+	// that intent and flip the session into plan mode.
+	if mode == autoPlanOff || collab == CollabPlan || collab == CollabAsk || goalActive {
 		return false
 	}
 	score := autoPlanScore(input)

@@ -100,8 +100,8 @@ func TestIdleStatuslineIsCompact(t *testing.T) {
 	if !strings.Contains(plain, "Auto") || !strings.Contains(plain, "ready") {
 		t.Fatalf("idle status line missing mode status:\n%s", plain)
 	}
-	if !strings.Contains(plain, "(shift+tab toggles plan · ctrl+y yolo)") {
-		t.Fatalf("idle status line missing plan-toggle hint:\n%s", plain)
+	if !strings.Contains(plain, "(shift+tab cycles plan/ask · ctrl+y yolo)") {
+		t.Fatalf("idle status line missing plan/ask-cycle hint:\n%s", plain)
 	}
 	for _, old := range []string{"Shift-Tab", "Ctrl-O", "Ctrl-D", "Enter sends", "Esc clears/exits state", "PgUp/PgDn"} {
 		if strings.Contains(plain, old) {
@@ -121,7 +121,7 @@ func TestYoloStatuslineUsesDangerPill(t *testing.T) {
 
 	content := renderStatuslineView(t, true)
 	plain := bottomStatusPlain(content)
-	if !strings.Contains(plain, "YOLO") || !strings.Contains(plain, "approvals skipped") || !strings.Contains(plain, "(shift+tab toggles plan · ctrl+y yolo)") {
+	if !strings.Contains(plain, "YOLO") || !strings.Contains(plain, "approvals skipped") || !strings.Contains(plain, "(shift+tab cycles plan/ask · ctrl+y yolo)") {
 		t.Fatalf("YOLO status line missing warning text:\n%s", plain)
 	}
 	if strings.Contains(plain, "[YOLO]") {
@@ -137,7 +137,7 @@ func TestPlanStatuslineUsesBluePill(t *testing.T) {
 
 	content := renderPlanStatuslineView(t)
 	plain := bottomStatusPlain(content)
-	if !strings.Contains(plain, "Plan") || !strings.Contains(plain, "ready") || !strings.Contains(plain, "(shift+tab toggles plan · ctrl+y yolo)") {
+	if !strings.Contains(plain, "Plan") || !strings.Contains(plain, "ready") || !strings.Contains(plain, "(shift+tab cycles plan/ask · ctrl+y yolo)") {
 		t.Fatalf("plan status line missing mode status:\n%s", plain)
 	}
 	if !strings.Contains(content, "\x1b[48;2;37;99;235m") {
@@ -151,10 +151,10 @@ func TestStatuslineCycleHintFollowsLanguage(t *testing.T) {
 
 	content := renderStatuslineView(t, false)
 	plain := bottomStatusPlain(content)
-	if !strings.Contains(plain, "Auto") || !strings.Contains(plain, "就绪") || !strings.Contains(plain, "(shift+tab 切换计划 · ctrl+y yolo)") {
-		t.Fatalf("localized plan-toggle hint missing:\n%s", plain)
+	if !strings.Contains(plain, "Auto") || !strings.Contains(plain, "就绪") || !strings.Contains(plain, "(shift+tab 循环计划/问答 · ctrl+y yolo)") {
+		t.Fatalf("localized plan/ask-cycle hint missing:\n%s", plain)
 	}
-	if strings.Contains(plain, "ready") || strings.Contains(plain, "shift+tab toggles plan · ctrl+y yolo") {
+	if strings.Contains(plain, "ready") || strings.Contains(plain, "shift+tab cycles plan/ask · ctrl+y yolo") {
 		t.Fatalf("localized status line should not fall back to English:\n%s", plain)
 	}
 }
@@ -164,8 +164,8 @@ func TestDesktopShortcutStatuslineUsesPlanToggleHint(t *testing.T) {
 
 	content := renderStatuslineViewWithShortcutLayout(t, "desktop")
 	plain := bottomStatusPlain(content)
-	if !strings.Contains(plain, "Ask") || !strings.Contains(plain, "(shift+tab toggles plan · ctrl+y yolo)") {
-		t.Fatalf("desktop shortcut status line missing unified plan-toggle hint:\n%s", plain)
+	if !strings.Contains(plain, "Ask") || !strings.Contains(plain, "(shift+tab cycles plan/ask · ctrl+y yolo)") {
+		t.Fatalf("desktop shortcut status line missing unified plan/ask-cycle hint:\n%s", plain)
 	}
 	if strings.Contains(plain, "ask/auto/plan") {
 		t.Fatalf("desktop shortcut status line should not advertise Ask/Auto/Plan cycling:\n%s", plain)
@@ -328,7 +328,7 @@ func renderPlanStatuslineView(t *testing.T) string {
 
 	ctrl := control.New(control.Options{})
 	m := newChatTUI(ctrl, "", make(chan event.Event, 1), 80)
-	m.planMode = true
+	m.collabMode = control.CollabPlan
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	return next.(chatTUI).View().Content
 }

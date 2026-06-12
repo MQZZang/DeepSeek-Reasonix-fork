@@ -3089,8 +3089,13 @@ func currentTabCollaborationMode(tab *WorkspaceTab) string {
 	if tab == nil {
 		return "normal"
 	}
-	if tab.Ctrl != nil && tab.Ctrl.PlanMode() {
-		return "plan"
+	if tab.Ctrl != nil {
+		switch tab.Ctrl.CollaborationMode() {
+		case control.CollabPlan:
+			return "plan"
+		case control.CollabAsk:
+			return "ask"
+		}
 	}
 	if strings.TrimSpace(currentTabGoal(tab)) != "" && currentTabGoalStatus(tab) == control.GoalStatusRunning {
 		return "goal"

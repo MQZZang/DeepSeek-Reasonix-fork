@@ -135,7 +135,7 @@ func (m chatTUI) statusModeColor() cliColor {
 	switch {
 	case m.ctrl != nil && m.ctrl.AutoApproveTools():
 		return statusYoloColor
-	case m.planMode:
+	case m.planModeOn(), m.askModeOn():
 		return statusPlanColor
 	default:
 		return statusAutoColor

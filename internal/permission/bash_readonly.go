@@ -57,10 +57,14 @@ var readOnlyBashPrefixes = map[string]map[string]bool{
 	},
 }
 
-// isReadOnlyBashSubject returns true when a bash command is a known
+// IsReadOnlyBashSubject returns true when a bash command is a known
 // read-only operation. The subject is the JSON arg value extracted by
-// Subject() — for bash it is the raw command string.
-func isReadOnlyBashSubject(subject string) bool {
+// Subject() — for bash it is the raw command string. It is exported so
+// the bash tool (internal/tool/builtin/bash.go) can implement the
+// agent.commandReadOnly optional interface using the same classifier that
+// the permission gate already uses, enabling read-only bash under a
+// CeilingReadOnly parent.
+func IsReadOnlyBashSubject(subject string) bool {
 	cmd := strings.TrimSpace(subject)
 	if cmd == "" {
 		return false

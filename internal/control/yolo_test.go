@@ -20,6 +20,7 @@ import (
 // task still drafts a plan and must wait for the user's plan approval.
 func TestAutoApproveToolsStillAutoPlansAndRequiresPlanApproval(t *testing.T) {
 	prov := &scriptedTurns{turns: [][]provider.Chunk{
+		toolCallTurn("c1", "submit_plan", `{"title":"Implement issue 2395","phases":[{"name":"Add the config field"},{"name":"Wire it into boot"},{"name":"Add tests"}]}`),
 		textTurn("Plan:\n1. Add the config field\n2. Wire it into boot\n3. Add tests"),
 		textTurn("Done — implemented the approved plan."),
 	}}
@@ -83,8 +84,8 @@ func TestAutoApproveToolsStillAutoPlansAndRequiresPlanApproval(t *testing.T) {
 	if !seeded {
 		t.Fatal("approved plan should seed the task list")
 	}
-	if prov.call != 2 {
-		t.Fatalf("provider called %d times, want 2 (plan + execution)", prov.call)
+	if prov.call != 3 {
+		t.Fatalf("provider called %d times, want 3 (submit + plan reply + execution)", prov.call)
 	}
 }
 

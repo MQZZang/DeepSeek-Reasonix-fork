@@ -75,11 +75,13 @@ type Messages struct {
 	ChatStatusRetryingFmt       string // "%s retrying (%d/%d)…" — %s = spinner, %d/%d = attempt/max
 	ChatStatusIdle              string // shortcuts hint when idle
 	ChatStatusYoloIdle          string // shortcuts hint when idle in YOLO/bypass mode
-	ChatStatusCycleHint         string // plan-toggle shortcut hint shown when no modal prompt owns the status row
+	ChatStatusCycleHint         string // plan/ask-cycle shortcut hint shown when no modal prompt owns the status row
 	ChatStatusCacheNowFmt       string // cache status tag, "%s" = latest-turn hit rate with percent sign
 	ChatStatusCacheAvgFmt       string // cache status tag, "%s" = session-average hit rate with percent sign
 	ChatStatusPlanApproval      string // shortcuts hint while a plan is pending
 	PlanApprovalPrompt          string // one-line "plan above is ready" banner shown above the input
+	PlanFeedbackPrompt          string // banner while typing "request changes" feedback for a pending plan
+	PlanFeedbackSentFmt         string // transcript line echoing the revision feedback that was sent, %s = feedback
 	ChatStatusToolApproval      string // shortcuts hint while a tool call awaits approval
 	ToolApprovalPromptFmt       string // approval banner — tool, subject suffix, source/intent detail, choices
 	ToolApprovalChoices         string // standard approval choice list
@@ -161,6 +163,7 @@ type Messages struct {
 	CmdModel        string // /model
 	CmdMemory       string // /memory
 	CmdGoal         string // /goal
+	CmdAsk          string // /ask
 	CmdRemember     string // /remember
 	CmdForget       string // /forget
 	CmdMcp          string // /mcp
@@ -226,8 +229,19 @@ type Messages struct {
 	QuickRememberDoneFmt   string
 	GoalEmpty              string
 	GoalCurrentFmt         string
+	GoalCurrentStatusFmt   string
 	GoalSetFmt             string
 	GoalCleared            string
+	GoalPaused             string
+	GoalNothingToPause     string
+	GoalNothingToResume    string
+	GoalResumedFmt         string
+	GoalPausedMarkerless   string
+	GoalRestoredFmt        string
+	AskModeOn              string
+	AskModeOff             string
+	PlanArtifactSavedFmt   string
+	PlanNudgeDeclined      string
 	ModelSwitchUnavailable string
 	ModelSwitchBusy        string
 	ModelAlreadyOnFmt      string

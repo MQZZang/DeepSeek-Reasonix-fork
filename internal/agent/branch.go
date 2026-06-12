@@ -27,6 +27,23 @@ type BranchMeta struct {
 	WorkspaceRoot    string    `json:"workspace_root,omitempty"`
 	TopicID          string    `json:"topic_id,omitempty"`
 	TopicTitle       string    `json:"topic_title,omitempty"`
+	// Goal carries the session's in-flight goal (objective text, status, and
+	// progress counters) so a long-running objective survives restart/resume.
+	// nil when the session has no active goal; omitted from JSON so metas
+	// without goals are byte-identical to pre-goal-persistence ones.
+	Goal *GoalState `json:"goal,omitempty"`
+}
+
+// GoalState is the persisted form of the controller's goal-mode state. Status
+// uses the controller's goal status strings ("running", "paused", "blocked");
+// completed or cleared goals are removed from the sidecar rather than stored.
+type GoalState struct {
+	Text       string `json:"text"`
+	Status     string `json:"status"`
+	Turns      int    `json:"turns,omitempty"`
+	Blocks     int    `json:"blocks,omitempty"`
+	Block      string `json:"block,omitempty"`
+	Markerless int    `json:"markerless,omitempty"`
 }
 
 func (m BranchMeta) DefaultScope() string {

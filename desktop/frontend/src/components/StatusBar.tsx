@@ -137,6 +137,7 @@ export function StatusBar({
   const turnTokenLabel = formatTokenCount(turnTokens);
   const balanceLabel = balance?.available && balance.display ? balance.display : "-";
   const planMode = collaborationMode === "plan";
+  const askMode = collaborationMode === "ask";
   const goalMode = collaborationMode === "goal";
 
   return (
@@ -216,6 +217,7 @@ export function StatusBar({
           </span>
         </Tooltip>
         {planMode && <span className="statusbar__plan">{t("status.plan")}</span>}
+        {askMode && <span className="statusbar__ask">{t("status.collabAsk")}</span>}
         {goalMode && <span className="statusbar__plan">{t("composer.goalMode")}</span>}
         {toolApprovalMode === "auto" && (
           <Tooltip label={t("composer.accessAutoTitle")}>
