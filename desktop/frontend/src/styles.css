@@ -5189,6 +5189,14 @@ a[href] {
   color: var(--info, #58a6ff);
   letter-spacing: 0.6px;
 }
+.statusbar__goal-paused {
+  color: var(--warn, #d29922);
+  letter-spacing: 0.6px;
+}
+.statusbar__goal-blocked {
+  color: var(--danger, #f85149);
+  letter-spacing: 0.6px;
+}
 .statusbar__yolo {
   color: var(--mode-yolo-fg);
   letter-spacing: 0.6px;

@@ -384,6 +384,8 @@ export const en = {
   "status.jobsLabel": "jobs",
   "status.plan": "PLAN",
   "status.collabAsk": "Q&A",
+  "status.goalPaused": "GOAL PAUSED",
+  "status.goalBlocked": "GOAL BLOCKED",
   "status.switchModel": "Switch model",
   "status.noModels": "no switchable models",
   "status.modelSwitchFailed": "Model switch failed: {err}",

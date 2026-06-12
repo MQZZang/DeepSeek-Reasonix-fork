@@ -296,7 +296,7 @@ export interface Meta {
 export type CollaborationMode = "normal" | "plan" | "ask" | "goal";
 export type ToolApprovalMode = "ask" | "auto" | "yolo";
 export type TokenMode = "full" | "economy";
-export type GoalStatus = "running" | "complete" | "blocked" | "stopped";
+export type GoalStatus = "running" | "paused" | "complete" | "blocked" | "stopped";
 
 export function normalizeCollaborationMode(mode?: string, goal?: string, legacyMode?: Mode): CollaborationMode {
   if (mode === "plan" || mode === "ask" || mode === "goal" || mode === "normal") return mode;

@@ -2530,6 +2530,8 @@ export default function App() {
               running={state.running}
               collaborationMode={collaborationMode}
               toolApprovalMode={toolApprovalMode}
+              goalStatus={state.meta?.goalStatus}
+              goal={state.meta?.goal}
               sessionTurns={sessionTurns}
               sessionTokens={state.sessionTokens}
               turnTokens={state.turnTotalTokens}

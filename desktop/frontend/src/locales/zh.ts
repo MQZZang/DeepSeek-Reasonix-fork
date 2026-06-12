@@ -385,6 +385,8 @@ export const zh: Record<DictKey, string> = {
   "status.jobsLabel": "任务",
   "status.plan": "计划",
   "status.collabAsk": "问答",
+  "status.goalPaused": "目标已暂停",
+  "status.goalBlocked": "目标受阻",
   "status.switchModel": "切换模型",
   "status.noModels": "没有可切换模型",
   "status.modelSwitchFailed": "模型切换失败：{err}",

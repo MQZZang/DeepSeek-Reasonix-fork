@@ -3,7 +3,7 @@ import { Activity, CircleDollarSign, CircleGauge, Database, Layers, Percent, Ref
 import { Tooltip } from "./Tooltip";
 import { useI18n, type Translator } from "../lib/i18n";
 import { formatMoney } from "../lib/money";
-import { type BalanceInfo, type CollaborationMode, type ContextInfo, type JobView, type ToolApprovalMode, type WireUsage } from "../lib/types";
+import { type BalanceInfo, type CollaborationMode, type ContextInfo, type GoalStatus, type JobView, type ToolApprovalMode, type WireUsage } from "../lib/types";
 
 // JobsChip is the status-bar background-jobs indicator: a count that opens an
 // upward popover listing the running jobs (id · label · status), mirroring the
@@ -102,6 +102,8 @@ export function StatusBar({
   running,
   collaborationMode,
   toolApprovalMode,
+  goalStatus,
+  goal,
   sessionTurns,
   sessionTokens,
   turnTokens,
@@ -116,6 +118,8 @@ export function StatusBar({
   running: boolean;
   collaborationMode: CollaborationMode;
   toolApprovalMode: ToolApprovalMode;
+  goalStatus?: GoalStatus;
+  goal?: string;
   sessionTurns?: number;
   sessionTokens?: number;
   turnTokens?: number;
@@ -139,6 +143,8 @@ export function StatusBar({
   const planMode = collaborationMode === "plan";
   const askMode = collaborationMode === "ask";
   const goalMode = collaborationMode === "goal";
+  const goalPaused = Boolean(goal?.trim()) && goalStatus === "paused";
+  const goalBlocked = Boolean(goal?.trim()) && goalStatus === "blocked";
 
   return (
     <div className="statusbar">
@@ -219,6 +225,8 @@ export function StatusBar({
         {planMode && <span className="statusbar__plan">{t("status.plan")}</span>}
         {askMode && <span className="statusbar__ask">{t("status.collabAsk")}</span>}
         {goalMode && <span className="statusbar__plan">{t("composer.goalMode")}</span>}
+        {goalPaused && <span className="statusbar__goal-paused">{t("status.goalPaused")}</span>}
+        {goalBlocked && <span className="statusbar__goal-blocked">{t("status.goalBlocked")}</span>}
         {toolApprovalMode === "auto" && (
           <Tooltip label={t("composer.accessAutoTitle")}>
             <span className="statusbar__yolo">{t("composer.accessAuto")}</span>
