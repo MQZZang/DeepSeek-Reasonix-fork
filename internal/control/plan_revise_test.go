@@ -236,7 +236,7 @@ func TestRevisePlanReplyPlumbing(t *testing.T) {
 			}
 		})
 		go func() {
-			r, err := c.requestApprovalReply(context.Background(), tool, "")
+			r, err := c.requestApprovalReply(context.Background(), tool, "", nil)
 			if err != nil {
 				t.Errorf("requestApprovalReply(%s): %v", tool, err)
 			}

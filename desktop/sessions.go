@@ -3,7 +3,6 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,9 +14,6 @@ import (
 	"reasonix/internal/control"
 	"reasonix/internal/fileutil"
 )
-
-// errActiveSession is returned when a delete targets the session in use.
-var errActiveSession = errors.New("can't delete the session you're in — start a new one first")
 
 // sessions.go holds the desktop-only session-management state that the shared
 // kernel doesn't model: custom display titles. A session on disk is just a JSONL
@@ -120,6 +116,10 @@ type trashedSessionMeta struct {
 }
 
 func trashSessionArtifacts(dir, sessionPath, key string) error {
+	return trashSessionArtifactsBeforeMove(dir, sessionPath, key, nil)
+}
+
+func validateSessionTrashTarget(dir, sessionPath, key string) error {
 	if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
@@ -131,8 +131,24 @@ func trashSessionArtifacts(dir, sessionPath, key string) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
+	return nil
+}
+
+func trashSessionArtifactsBeforeMove(dir, sessionPath, key string, beforeMove func()) error {
+	if err := validateSessionTrashTarget(dir, sessionPath, key); err != nil {
+		return err
+	}
+	if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	itemDir := filepath.Join(sessionTrashPath(dir), key)
 	if err := os.MkdirAll(itemDir, 0o755); err != nil {
 		return err
+	}
+	if beforeMove != nil {
+		beforeMove()
 	}
 	if err := movePathIfExists(sessionPath, filepath.Join(itemDir, key)); err != nil {
 		return err
@@ -481,7 +497,11 @@ func recordSessionDisplay(dir, sessionPath, content, display string) error {
 // sessionDisplayResolver loads the sidecar once and returns a per-message
 // resolver, so a transcript of N messages doesn't re-read .display.json N times.
 func sessionDisplayResolver(dir, sessionPath string) func(content string) string {
-	byHash := loadSessionDisplays(dir)[filepath.Base(sessionPath)]
+	return sessionDisplayResolverFromMap(loadSessionDisplays(dir), sessionPath)
+}
+
+func sessionDisplayResolverFromMap(displays sessionDisplayMap, sessionPath string) func(content string) string {
+	byHash := displays[filepath.Base(sessionPath)]
 	return func(content string) string {
 		if byHash != nil {
 			if display := byHash[messageDisplayKey(content)]; strings.TrimSpace(display) != "" {

@@ -126,6 +126,7 @@ export interface TabMeta {
   workspaceName: string;
   topicId: string;
   topicTitle: string;
+  sessionPath?: string;
   filePath?: string;
   projectColor?: string;
   label: string;
@@ -144,10 +145,11 @@ export interface TabMeta {
 
 export interface ProjectNode {
   key: string;
-  kind: "project" | "topic" | "global_folder" | "global_topic";
+  kind: "project" | "topic" | "session" | "global_folder" | "global_topic" | "global_session";
   label: string;
   root?: string;
   topicId?: string;
+  sessionPath?: string;
   projectColor?: string;
   turns?: number;
   createdAt?: number;
@@ -155,10 +157,11 @@ export interface ProjectNode {
   open?: boolean;
   running?: boolean;
   status?: ProjectTopicStatus;
+  pinned?: boolean;
   children?: ProjectNode[];
 }
 
-export type ProjectTopicStatus = "thinking" | "streaming" | "waiting_confirmation" | "paused" | "error";
+export type ProjectTopicStatus = "thinking" | "streaming" | "waiting_confirmation" | "background_job" | "paused" | "error";
 
 export interface TopicMeta {
   id: string;
@@ -225,6 +228,20 @@ export interface HistoryToolCall {
   id: string;
   name: string;
   arguments: string;
+}
+
+export interface PromptHistoryEntry {
+  text: string;
+  at: number;          // unix ms
+  sessionPath: string;
+  turn: number;
+}
+
+export interface PromptHistoryResult {
+  entries: PromptHistoryEntry[] | null;
+  nonce: string;
+  olderCursor?: string;
+  hasOlder?: boolean;
 }
 
 // CheckpointMeta is one rewind point (a user turn) for the rewind UI.
@@ -471,6 +488,23 @@ export interface CapabilitiesView {
   skills: SkillView[];
   skillRoots: SkillRootView[];
 }
+export interface BuiltInMCPUpdateResult {
+  name: string;
+  version: string;
+  path: string;
+}
+
+export type BuiltInMCPUpdatePhase = "current" | "available" | "downloaded" | "activated" | "skipped" | "error";
+
+export interface BuiltInMCPUpdateStatus {
+  name: string;
+  mode: string;
+  current: string;
+  latest: string;
+  phase: BuiltInMCPUpdatePhase;
+  path?: string;
+  err?: string;
+}
 export interface MCPServerInput {
   name: string;
   transport: string; // stdio | http | sse
@@ -567,6 +601,7 @@ export interface MemoryView {
   archives: MemoryArchive[];
   scopes: MemoryScope[];
   storeDir: string;
+  storeGlobalDir?: string;
   available: boolean;
 }
 
@@ -645,6 +680,8 @@ export interface AgentView {
   maxSteps: number;
   plannerMaxSteps: number;
   systemPrompt: string;
+  coldResumePrune: boolean;
+  reasoningLanguage: string; // "auto" | "zh" | "en"
 }
 
 export interface BotAllowlistView {
@@ -663,6 +700,7 @@ export interface QQBotView {
   appId: string;
   appSecretEnv: string;
   secretSet: boolean;
+  sandbox: boolean;
 }
 
 export interface FeishuBotView {
@@ -696,6 +734,10 @@ export interface BotConnectionCredentialView {
 export interface BotConnectionSessionMappingView {
   remoteId: string;
   sessionId: string;
+  sessionSource: string;
+  chatType: string;
+  userId: string;
+  threadId: string;
   scope: "global" | "project" | string;
   workspaceRoot: string;
   updatedAt: string;
@@ -709,6 +751,7 @@ export interface BotConnectionView {
   enabled: boolean;
   status: "disconnected" | "pending" | "connected" | "error" | string;
   model: string;
+  toolApprovalMode: ToolApprovalMode | "" | string;
   workspaceRoot: string;
   credential: BotConnectionCredentialView;
   sessionMappings: BotConnectionSessionMappingView[];
@@ -720,6 +763,7 @@ export interface BotConnectionView {
 export interface BotSettingsView {
   enabled: boolean;
   model: string;
+  toolApprovalMode: ToolApprovalMode | "" | string;
   maxSteps: number;
   debounceMs: number;
   allowlist: BotAllowlistView;
@@ -727,6 +771,14 @@ export interface BotSettingsView {
   feishu: FeishuBotView;
   weixin: WeixinBotView;
   connections: BotConnectionView[];
+}
+
+export interface BotRuntimeStatusView {
+  running: boolean;
+  status: string;
+  message: string;
+  connections: number;
+  startedAt: string;
 }
 
 export interface BotInstallStartResult {
@@ -774,6 +826,11 @@ export interface BotConnectionDiagnostic {
   status: string;
   message: string;
   messageId: string;
+  phase: string;
+  code: string;
+  reportKind: string;
+  reportDetail: string;
+  occurredAt: string;
 }
 
 export interface SettingsView {
@@ -790,14 +847,16 @@ export interface SettingsView {
   agent: AgentView;
   bot: BotSettingsView;
   desktopLanguage: string; // "" | "en" | "zh"; empty = auto
+  desktopLayoutStyle: string; // "classic" | "workbench"
   desktopTheme: string; // "auto" | "dark" | "light"
   desktopThemeStyle: string;
   closeBehavior: string; // "background" | "quit"
-  displayMode: string;   // "standard" | "compact" | "minimal"
+  displayMode: string;   // "standard" | "compact"
+  statusBarStyle: string; // "icon" | "text"
+  statusBarItems: string[]; // ordered visible status bar item ids
   checkUpdates: boolean; // check for new versions on startup
   telemetry: boolean; // anonymous launch ping (install id + version + OS)
   metrics: boolean; // opt-in aggregate agent metrics (anonymous signal/bucket counts)
-  expandThinking: boolean; // show reasoning text expanded by default
   configPath: string;
   providerKinds: string[]; // provider implementations the kernel registered (for the kind picker)
   autoApproveTools: boolean;

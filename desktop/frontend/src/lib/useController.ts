@@ -5,9 +5,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { asArray } from "./array";
+import { addBreadcrumb } from "./breadcrumbs";
 import { app, onEvent, onReady } from "./bridge";
+import { invalidateCache } from "./composerHistory";
 import { createRafBatch } from "./rafBatch";
 import { t } from "./i18n";
+import { summarize } from "./tools";
 import { modeHasAutoApproveTools } from "./types";
 import type {
   BalanceInfo,
@@ -33,13 +36,13 @@ import type {
 
 export type ToolStatus = "running" | "done" | "error" | "stopped";
 
-export type LiveStream = { id: string; text: string; reasoning: string };
+export type LiveStream = { id: string; text: string; reasoning: string; reasoningComplete: boolean };
 export type MessageActionScope = "fork" | "summ-from" | "summ-upto" | "conversation" | "code" | "both";
 export type MessageActionState = { turn: number; scope: MessageActionScope };
 
 export type Item =
   | { kind: "user"; id: string; text: string; failed?: boolean }
-  | { kind: "assistant"; id: string; text: string; reasoning: string; streaming: boolean }
+  | { kind: "assistant"; id: string; text: string; reasoning: string; streaming: boolean; reasoningComplete?: boolean }
   | { kind: "phase"; id: string; text: string }
   | { kind: "notice"; id: string; level: "info" | "warn"; text: string }
   | {
@@ -61,7 +64,9 @@ export type Item =
       output?: string;
       error?: string;
       truncated?: boolean;
+      dataArchived?: boolean; // args/output trimmed for memory; full data available via backend
       durationMs?: number;
+      summary?: string; // stable collapsed readout kept even after args/output archive
       isShell?: boolean; // true for !-prefix shell commands (controls default expand)
       parentId?: string; // a sub-agent call nests under the `task` call with this id
       profile?: { model?: string; effort?: string }; // subagent model/effort from tool event
@@ -88,6 +93,7 @@ interface State {
   turnStartAt: number;
   turnTokens: number;
   turnTotalTokens: number;
+  turnCost: number;
   sessionTokens: number;
   sessionCost: number;
   sessionCurrency: string;
@@ -105,6 +111,7 @@ export const initialState: State = {
   turnStartAt: 0,
   turnTokens: 0,
   turnTotalTokens: 0,
+  turnCost: 0,
   sessionTokens: 0,
   sessionCost: 0,
   sessionCurrency: "¥",
@@ -137,10 +144,20 @@ export function sameMeta(a?: Meta, b?: Meta): boolean {
   );
 }
 
-/** Known read-only tool names. Session restore hardcodes readOnly=false for all
- *  tools, so we derive it from the name to enable correct batching.
- *  Mirrors Go backend ReadOnly() + codegraph ReadOnlyToolNames(). */
-function isReadOnlyTool(name: string): boolean {
+const STALE_TURN_RECONCILE_MS = 30_000;
+
+export function shouldReconcileStaleTurn(
+  state: Pick<State, "running" | "turnActive"> | undefined,
+  lastTurnActivityAt: number,
+  now = Date.now(),
+  timeoutMs = STALE_TURN_RECONCILE_MS,
+): boolean {
+  if (!state?.running || !state.turnActive || lastTurnActivityAt <= 0) return false;
+  return Math.max(0, now - lastTurnActivityAt) >= timeoutMs;
+}
+
+/** Mirrors Go backend's ReadOnly() + codegraph ReadOnlyToolNames(). */
+export function isReadOnlyTool(name: string): boolean {
   switch (name) {
     case "read_file":
     case "ls":
@@ -196,11 +213,14 @@ export function historyMessagesToItems(messages: HistoryMessage[], idPrefix: str
       resultByID.set(m.toolCallId, m);
     }
   }
+  const positionalResults = positionalToolResults(messages);
+  const consumedPositionalToolIndexes = new Set(Array.from(positionalResults.values(), (result) => result.index));
 
   const items: Item[] = [];
   let seq = startSeq;
   const consumedToolIDs = new Set<string>();
-  for (const m of messages) {
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const m = messages[messageIndex];
     if (m.role === "system") continue;
     if (m.role === "phase") {
       if (m.content.trim() !== "") {
@@ -241,18 +261,21 @@ export function historyMessagesToItems(messages: HistoryMessage[], idPrefix: str
         items.push({ kind: "assistant", id: `${idPrefix}${seq}`, text: m.content, reasoning: m.reasoning ?? "", streaming: false });
         seq++;
       }
-      for (const tc of m.toolCalls ?? []) {
-        const result = resultByID.get(tc.id);
+      const toolCalls = m.toolCalls ?? [];
+      for (let callIndex = 0; callIndex < toolCalls.length; callIndex += 1) {
+        const tc = toolCalls[callIndex];
+        const positionalResult = tc.id ? undefined : positionalResults.get(positionalToolResultKey(messageIndex, callIndex));
+        const result = tc.id ? resultByID.get(tc.id) : positionalResult?.message;
         if (tc.id) consumedToolIDs.add(tc.id);
         const output = result?.content ?? "";
-        const error = output.startsWith("[error") || output.startsWith("Error:") ? output : undefined;
+        const error = result ? historyToolError(output) : undefined;
         items.push({
           kind: "tool",
           id: tc.id || `${idPrefix}tool${seq}`,
           name: tc.name,
           args: tc.arguments ?? "",
           readOnly: isReadOnlyTool(tc.name),
-          status: error ? "error" : "done",
+          status: result ? (error ? "error" : "done") : "stopped",
           output,
           error,
           isShell: (tc.id || "").startsWith("shell-"),
@@ -262,9 +285,9 @@ export function historyMessagesToItems(messages: HistoryMessage[], idPrefix: str
       continue;
     }
     if (m.role === "tool") {
-      if (m.toolCallId && consumedToolIDs.has(m.toolCallId)) continue;
+      if ((m.toolCallId && consumedToolIDs.has(m.toolCallId)) || consumedPositionalToolIndexes.has(messageIndex)) continue;
       const output = m.content;
-      const error = output.startsWith("[error") || output.startsWith("Error:") ? output : undefined;
+      const error = historyToolError(output);
       items.push({
         kind: "tool",
         id: m.toolCallId || `${idPrefix}tool${seq}`,
@@ -281,6 +304,51 @@ export function historyMessagesToItems(messages: HistoryMessage[], idPrefix: str
     }
   }
   return { items, seq };
+}
+
+function positionalToolResults(messages: HistoryMessage[]): Map<string, { message: HistoryMessage; index: number }> {
+  const out = new Map<string, { message: HistoryMessage; index: number }>();
+  const consumed = new Set<number>();
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const message = messages[messageIndex];
+    const toolCalls = message.role === "assistant" ? message.toolCalls ?? [] : [];
+    if (toolCalls.length === 0) continue;
+    let resultIndex = messageIndex + 1;
+    for (let callIndex = 0; callIndex < toolCalls.length; callIndex += 1) {
+      if (toolCalls[callIndex].id) continue;
+      let matched = false;
+      while (resultIndex < messages.length) {
+        const candidate = messages[resultIndex];
+        if (candidate.role !== "tool") break;
+        const candidateIndex = resultIndex;
+        resultIndex += 1;
+        if (candidate.toolCallId || consumed.has(candidateIndex)) continue;
+        consumed.add(candidateIndex);
+        out.set(positionalToolResultKey(messageIndex, callIndex), { message: candidate, index: candidateIndex });
+        matched = true;
+        break;
+      }
+      if (!matched) break;
+    }
+  }
+  return out;
+}
+
+function positionalToolResultKey(messageIndex: number, callIndex: number): string {
+  return `${messageIndex}:${callIndex}`;
+}
+
+function historyToolError(output: string): string | undefined {
+  const trimmed = output.trimStart();
+  if (
+    trimmed.startsWith("[error") ||
+    trimmed.startsWith("Error:") ||
+    trimmed.startsWith("error:") ||
+    trimmed.startsWith("blocked:")
+  ) {
+    return output;
+  }
+  return undefined;
 }
 
 function ensureAssistant(s: State): { items: Item[]; id: string; seq: number } {
@@ -328,14 +396,17 @@ function applyEvent(s: State, e: WireEvent): State {
       let cur: State = s;
       if (cur.pendingUser !== undefined) cur = flushPendingUser(cur);
       const { items, id, seq } = ensureAssistant(cur);
-      return { ...cur, items, currentAssistant: id, seq, live: { id, text: "", reasoning: "" }, running: true, turnActive: true, turnStartAt: Date.now(), turnTokens: 0, turnTotalTokens: 0 };
+      return { ...cur, items, currentAssistant: id, seq, live: { id, text: "", reasoning: "", reasoningComplete: false }, running: true, turnActive: true, turnStartAt: Date.now(), turnTokens: 0, turnTotalTokens: 0, turnCost: 0 };
     }
     case "text":
     case "reasoning": {
       const { items, id, seq } = ensureAssistant(s);
       const delta = e.text ?? e.reasoning ?? "";
-      const base = s.live?.id === id ? s.live : { id, text: "", reasoning: "" };
-      const live = e.kind === "text" ? { ...base, text: base.text + delta } : { ...base, reasoning: base.reasoning + delta };
+      const base = s.live?.id === id ? s.live : { id, text: "", reasoning: "", reasoningComplete: false };
+      const live =
+        e.kind === "text"
+          ? { ...base, text: base.text + delta, reasoningComplete: base.reasoning !== "" || base.reasoningComplete }
+          : { ...base, reasoning: base.reasoning + delta, reasoningComplete: false };
       return { ...s, items, live, currentAssistant: id, seq };
     }
     case "message": {
@@ -360,10 +431,15 @@ function applyEvent(s: State, e: WireEvent): State {
       if (idx >= 0) {
         const next = [...s.items];
         const it = next[idx];
-        if (it.kind === "tool") next[idx] = { ...it, name: t.name, args: t.args ? t.args : it.args, readOnly: t.readOnly, profile: t.profile ?? it.profile };
+        if (it.kind === "tool") {
+          const args = t.args ? t.args : it.args;
+          const summary = summarize(t.name, args) || (t.name === it.name && args === it.args ? it.summary : undefined);
+          next[idx] = { ...it, name: t.name, args, readOnly: t.readOnly, profile: t.profile ?? it.profile, summary };
+        }
         return { ...s, items: next };
       }
-      return { ...s, seq: s.seq + 1, items: [...s.items, { kind: "tool", id, name: t.name, args: t.args ?? "", readOnly: t.readOnly, status: "running", isShell: id.startsWith("shell-"), parentId: t.parentId, profile: t.profile }] };
+      const args = t.args ?? "";
+      return { ...s, seq: s.seq + 1, items: [...s.items, { kind: "tool", id, name: t.name, args, readOnly: t.readOnly, status: "running", summary: summarize(t.name, args), isShell: id.startsWith("shell-"), parentId: t.parentId, profile: t.profile }] };
     }
     case "tool_result": {
       const t = e.tool;
@@ -378,7 +454,15 @@ function applyEvent(s: State, e: WireEvent): State {
       }
       if (idx >= 0) {
         const it = next[idx];
-        if (it.kind === "tool") next[idx] = { ...it, status: t.err ? "error" : "done", output: t.output, error: t.err, truncated: t.truncated, durationMs: t.durationMs };
+        if (it.kind === "tool") {
+          // Archive immediately: collapsed cards only show tool name + command
+          // subject (from args). Drop output entirely; full data is loaded on
+          // demand via app.ToolResultForTab when the card is expanded.
+          const existing = it;
+          const shortArgs = existing.args && existing.args.length > 200 ? existing.args.slice(0, 200) + "…" : existing.args;
+          const summary = t.err ? undefined : existing.summary || summarize(existing.name, existing.args, t.output);
+          next[idx] = { ...existing, status: t.err ? "error" : "done", args: shortArgs, output: undefined, error: t.err, truncated: t.truncated, durationMs: t.durationMs, dataArchived: true, summary };
+        }
       }
       return { ...s, items: next };
     }
@@ -399,9 +483,10 @@ function applyEvent(s: State, e: WireEvent): State {
       const turnTotalTokens = s.turnTotalTokens + usageTokens;
       const sessionTokens = s.sessionTokens + usageTokens;
       const usageCost = e.usage?.cost ?? e.usage?.costUsd ?? 0;
+      const turnCost = s.turnCost + usageCost;
       const sessionCost = s.sessionCost + usageCost;
       const sessionCurrency = e.usage?.currency || s.sessionCurrency || "¥";
-      return { ...s, usage: e.usage, context: { ...s.context, used, sessionTokens }, turnTokens, turnTotalTokens, sessionTokens, sessionCost, sessionCurrency };
+      return { ...s, usage: e.usage, context: { ...s.context, used, sessionTokens }, turnTokens, turnTotalTokens, turnCost, sessionTokens, sessionCost, sessionCurrency };
     }
     case "notice":
       return { ...s, running: s.turnActive ? s.running : false, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `n${s.seq}`, level: e.level ?? "info", text: e.text ?? "" }] };
@@ -433,7 +518,7 @@ function applyEvent(s: State, e: WireEvent): State {
         if (it.kind === "tool" && it.status === "running") return { ...it, status: "stopped" as const };
         return it;
       });
-      const items: Item[] = e.err ? [...finalized, { kind: "notice", id: `e${s.seq}`, level: "warn", text: e.err }] : finalized;
+      let items: Item[] = e.err ? [...finalized, { kind: "notice", id: `e${s.seq}`, level: "warn", text: e.err }] : finalized;
       return { ...s, items, live: undefined, running: false, turnActive: false, currentAssistant: undefined, approval: undefined, ask: undefined, seq: s.seq + 1 };
     }
     default: return s;
@@ -452,6 +537,7 @@ export function reducer(s: State, a: Action): State {
         turnStartAt: Date.now(),
         turnTokens: 0,
         turnTotalTokens: 0,
+        turnCost: 0,
         pendingUser: a.text,
         discardTurn: false,
       };
@@ -494,7 +580,16 @@ export function reducer(s: State, a: Action): State {
     case "message_action_done": return { ...s, messageAction: undefined };
     case "history": {
       const { items, seq } = historyMessagesToItems(a.messages, "h", s.seq);
-      return { ...s, items, seq };
+      // Archive all tool items loaded from history: collapsed cards only need
+      // tool name + command; full data is loaded on demand from the backend.
+      const archived = items.map((it) => {
+        if (it.kind !== "tool") return it;
+        const t = it;
+        const shortArgs = t.args && t.args.length > 200 ? t.args.slice(0, 200) + "…" : t.args;
+        if (shortArgs === t.args && (t.output === undefined || t.output === "")) return it;
+        return { ...t, args: shortArgs, output: undefined, dataArchived: true };
+      });
+      return { ...s, items: archived, seq };
     }
     case "local_notice": return { ...s, running: false, turnActive: false, seq: s.seq + 1, items: [...s.items, { kind: "notice", id: `n${s.seq}`, level: a.level, text: a.text }] };
     case "clearApproval": return { ...s, approval: undefined };
@@ -547,9 +642,14 @@ async function refreshMetaForTab(tabId: string, dispatchTo: (tabId: string, acti
   }
 }
 
+export function replayPendingPromptsForActiveTab(activeTabId: string | undefined, replay: () => Promise<void> = () => app.ReplayPendingPrompts()): void {
+  if (!activeTabId) return;
+  void replay().catch(() => {});
+}
+
 export function useController() {
   const statesRef = useRef<TabStates>(new Map());
-  const lastTokenAt = useRef(0);
+  const lastTurnActivityAtByTab = useRef(new Map<string, number>());
   const [activeTabId, setActiveTabId] = useState<string | undefined>();
   const activeTabIdRef = useRef<string | undefined>(undefined);
   // A render-triggering counter so that mutations to a non-active tab's state still
@@ -643,17 +743,17 @@ export function useController() {
     return active.id;
   }, [activeTabFromBackend, loadSessionDataForTab]);
 
-  const reconcileTabRuntime = useCallback(async (tabId: string) => {
+  const reconcileTabRuntime = useCallback(async (tabId: string): Promise<TabMeta[] | undefined> => {
     const tabs = asArray(await app.ListTabs().catch(() => [] as TabMeta[]));
     const tab = tabs.find((candidate) => candidate.id === tabId);
-    if (!tab) return;
+    if (!tab) return undefined;
     const local = statesRef.current.get(tabId);
     const needsInitialLoad = !local?.meta;
     const missedTurnDone = Boolean(local?.running && !tab.running);
     dispatchTo(tabId, { type: "backend_status", running: Boolean(tab.running) });
     if (needsInitialLoad || missedTurnDone) {
       await loadSessionDataForTab(tabId, missedTurnDone);
-      return;
+      return tabs;
     }
     const [jobs, effort, balance] = await Promise.all([
       app.JobsForTab(tabId).catch(() => undefined),
@@ -663,6 +763,7 @@ export function useController() {
     if (jobs) dispatchTo(tabId, { type: "jobs", jobs: asArray(jobs) });
     if (effort) dispatchTo(tabId, { type: "effort", effort });
     if (balance) dispatchTo(tabId, { type: "balance", balance });
+    return tabs;
   }, [dispatchTo, loadSessionDataForTab]);
 
   useEffect(() => {
@@ -672,8 +773,16 @@ export function useController() {
     const off = onEvent((e) => {
       const targetTabId = e.tabId || activeTabIdRef.current;
       if (!targetTabId) return;
-      if (e.kind === "turn_started" || e.kind === "text" || e.kind === "reasoning") {
-        lastTokenAt.current = Date.now();
+      if (
+        e.kind === "turn_started" ||
+        e.kind === "text" ||
+        e.kind === "reasoning" ||
+        e.kind === "message" ||
+        e.kind === "tool_dispatch" ||
+        e.kind === "tool_progress" ||
+        e.kind === "tool_result"
+      ) {
+        lastTurnActivityAtByTab.current.set(targetTabId, Date.now());
       }
       if (e.kind === "text" || e.kind === "reasoning") {
         textBatch.push({ tabId: targetTabId, e });
@@ -718,27 +827,36 @@ export function useController() {
     return () => { textBatch.drain(); off(); offReady(); };
   }, [dispatchTo, loadSessionDataForTab, refreshCheckpoints, syncActiveTabFromBackend]);
 
-  // Stale-stream watchdog: if the frontend thinks the agent is running but
-  // no token events have arrived for 30 seconds, reconcile with the backend.
-  // This catches the case where the Wails event channel silently drops the
-  // turn_done event after a model-service interruption (#3746).
+  // Stale-turn watchdog: if the frontend thinks the agent is running but the
+  // turn stream has gone quiet, reconcile with the backend. This catches cases
+  // where the Wails event channel silently drops turn_done after the final
+  // message or synthetic todo update has already closed the live stream.
   useEffect(() => {
     if (!activeTabId) return;
     const s = statesRef.current.get(activeTabId);
-    if (!s?.running || !s.live) return;
-    const since = Date.now() - lastTokenAt.current;
-    if (since >= 30_000) {
+    const now = Date.now();
+    const lastTurnActivityAt = lastTurnActivityAtByTab.current.get(activeTabId) ?? 0;
+    if (!s?.running || !s.turnActive || lastTurnActivityAt <= 0) return;
+    const since = Math.max(0, now - lastTurnActivityAt);
+    if (shouldReconcileStaleTurn(s, lastTurnActivityAt, now)) {
       void reconcileTabRuntime(activeTabId);
       return;
     }
     const timer = window.setTimeout(() => {
       const cur = statesRef.current.get(activeTabId);
-      if (cur?.running && cur.live && Date.now() - lastTokenAt.current >= 30_000) {
+      const lastActivity = lastTurnActivityAtByTab.current.get(activeTabId) ?? 0;
+      if (shouldReconcileStaleTurn(cur, lastActivity)) {
         void reconcileTabRuntime(activeTabId);
       }
-    }, 30_000 - since);
+    }, STALE_TURN_RECONCILE_MS - since);
     return () => window.clearTimeout(timer);
-  }, [activeTabId, reconcileTabRuntime, activeState.running, activeState.live]);
+  }, [activeTabId, reconcileTabRuntime, activeState.running, activeState.turnActive]);
+
+  // Replay any pending approval/ask prompts when switching tabs, so a
+  // plan-mode session left awaiting confirmation rebuilds its modal (#4275).
+  useEffect(() => {
+    replayPendingPromptsForActiveTab(activeTabId);
+  }, [activeTabId]);
 
   const send = useCallback((displayText: string, submitText = displayText) => {
     const submitForTab = (tabId: string) => {
@@ -746,6 +864,7 @@ export function useController() {
       dispatchTo(tabId, { type: "user", text: displayText, seq });
       const display = displayText.trim();
       const submit = submitText.trim();
+      invalidateCache();
       (display !== submit ? app.SubmitDisplayToTab(tabId, display, submit) : app.SubmitToTab(tabId, submit)).catch((error) => {
         dispatchTo(tabId, { type: "send_failed", error: `Send failed: ${error instanceof Error ? error.message : String(error)}` });
       });
@@ -848,6 +967,7 @@ export function useController() {
     } catch {
       return; // backend refused (workspace starting / failed) — keep the transcript
     }
+    invalidateCache();
     if (tabId) dispatchTo(tabId, { type: "reset" });
   }, [activeTabId, bumpCheckpointRefreshSeq, dispatchTo]);
 
@@ -859,6 +979,7 @@ export function useController() {
     } catch {
       return;
     }
+    invalidateCache();
     if (tabId) dispatchTo(tabId, { type: "reset" });
   }, [activeTabId, bumpCheckpointRefreshSeq, dispatchTo]);
 
@@ -879,10 +1000,10 @@ export function useController() {
   }, [activeTabId, dispatchTo, refreshCheckpoints, waitForTabReady]);
 
   const previewSession = useCallback(async (path: string): Promise<HistoryMessage[]> => asArray<HistoryMessage>(await app.PreviewSession(path).catch(() => [])), []);
-  const deleteSession = useCallback((path: string) => app.DeleteSession(path).catch(() => {}), []);
-  const restoreSession = useCallback((path: string) => app.RestoreSession(path).catch(() => {}), []);
-  const purgeTrashedSession = useCallback((path: string) => app.PurgeTrashedSession(path).catch(() => {}), []);
-  const renameSession = useCallback((path: string, title: string) => app.RenameSession(path, title).catch(() => {}), []);
+  const deleteSession = useCallback((path: string) => app.DeleteSession(path).catch(() => {}).finally(() => invalidateCache()), []);
+  const restoreSession = useCallback((path: string) => app.RestoreSession(path).catch(() => {}).finally(() => invalidateCache()), []);
+  const purgeTrashedSession = useCallback((path: string) => app.PurgeTrashedSession(path).catch(() => {}).finally(() => invalidateCache()), []);
+  const renameSession = useCallback((path: string, title: string) => app.RenameSession(path, title).catch(() => {}).finally(() => invalidateCache()), []);
 
   const refreshMeta = useCallback(async () => {
     if (!activeTabId) return;
@@ -994,12 +1115,14 @@ export function useController() {
   }, [activeTabId, dispatchTo, loadSessionDataForTab, syncActiveTabFromBackend, waitForTabReady]);
 
   // Tab management: switch preserves per-tab state; open creates it.
-  const switchTab = useCallback(async (tabId: string) => {
+  const switchTab = useCallback(async (tabId: string): Promise<TabMeta[] | undefined> => {
+    addBreadcrumb("nav", `switch tab ${tabId}`);
     setActiveTabId(tabId);
     try {
       await app.SetActiveTab(tabId);
-      await reconcileTabRuntime(tabId);
+      return await reconcileTabRuntime(tabId);
     } catch { /* ignore */ }
+    return undefined;
   }, [reconcileTabRuntime]);
 
   const openProjectTab = useCallback(async (workspaceRoot: string, topicId: string): Promise<TabMeta> => {
@@ -1011,6 +1134,13 @@ export function useController() {
 
   const openGlobalTab = useCallback(async (topicId: string): Promise<TabMeta> => {
     const meta = await app.OpenGlobalTab(topicId);
+    setActiveTabId(meta.id);
+    await loadSessionDataForTab(meta.id, !statesRef.current.has(meta.id));
+    return meta;
+  }, [loadSessionDataForTab]);
+
+  const openTopicSession = useCallback(async (scope: string, workspaceRoot: string, topicId: string, sessionPath: string): Promise<TabMeta> => {
+    const meta = await app.OpenTopicSession(scope, workspaceRoot, topicId, sessionPath);
     setActiveTabId(meta.id);
     await loadSessionDataForTab(meta.id, !statesRef.current.has(meta.id));
     return meta;
@@ -1047,7 +1177,7 @@ export function useController() {
     newSession, clearSession, listSessions, listTrashedSessions, resumeSession, previewSession, deleteSession, restoreSession, purgeTrashedSession, renameSession,
     refreshMeta, pickWorkspace, switchWorkspace, compact, rewind, setModel, setEffort, setTokenMode,
     fetchMemory, remember, forget, saveDoc,
-    switchTab, openProjectTab, openGlobalTab, ensureBlankTab, closeTab, reorderTabs,
+    switchTab, openProjectTab, openGlobalTab, openTopicSession, ensureBlankTab, closeTab, reorderTabs,
     syncActiveTab: syncActiveTabFromBackend,
   };
 }

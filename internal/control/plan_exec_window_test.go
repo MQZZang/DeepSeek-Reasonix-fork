@@ -22,6 +22,8 @@ import (
 	"reasonix/internal/permission"
 	"reasonix/internal/provider"
 	"reasonix/internal/tool"
+
+	_ "reasonix/internal/tool/builtin"
 )
 
 // fakePreviewableTool augments fakeTool with tool.Previewer — the capability
@@ -33,17 +35,27 @@ func (f fakePreviewableTool) Preview(json.RawMessage) (diff.Change, error) {
 	return diff.Change{Path: "fake", NewText: "x"}, nil
 }
 
+func execWindowRegistry(tools ...tool.Tool) *tool.Registry {
+	reg := tool.NewRegistry()
+	reg.Add(&fakeTool{name: "submit_plan", readOnly: true})
+	for _, bt := range tool.Builtins() {
+		if bt.Name() == "complete_step" || bt.Name() == "todo_write" {
+			reg.Add(bt)
+		}
+	}
+	for _, tl := range tools {
+		reg.Add(tl)
+	}
+	return reg
+}
+
 // execWindowController wires a real agent behind an interactive approval gate
 // around scripted turns, in plan mode, with a fake submit_plan plus the given
 // tools registered. The registry is shared with the controller so the window
 // can consult tool capabilities.
 func execWindowController(t *testing.T, prov *scriptedTurns, decide func(event.Approval) bool, tools ...tool.Tool) (*Controller, func() []event.Approval) {
 	t.Helper()
-	reg := tool.NewRegistry()
-	reg.Add(&fakeTool{name: "submit_plan", readOnly: true})
-	for _, tl := range tools {
-		reg.Add(tl)
-	}
+	reg := execWindowRegistry(tools...)
 	b, sink := newBaselineEvents()
 	ag := agent.New(prov, reg, agent.NewSession(""), agent.Options{}, sink)
 	c := New(Options{
@@ -75,7 +87,8 @@ func runTurnErr(t *testing.T, c *Controller, input string) error {
 	}
 }
 
-// TestPlanExecWindowWaivesPreviewableWriters: inside the execution turn of a
+const planExecTodosDone = `{"todos":[{"content":"Reproduce","status":"completed","level":0},{"content":"write failing test","status":"completed","level":1},{"content":"Fix","status":"completed","level":0},{"content":"correct the operator","status":"completed","level":1}]}`
+
 // just-approved plan, a previewable file writer runs without an approval
 // prompt — approving the plan was the approval for those edits. The waiver
 // lasts exactly that turn: the same writer prompts again on the next turn.
@@ -85,6 +98,7 @@ func TestPlanExecWindowWaivesPreviewableWriters(t *testing.T) {
 		toolCallTurn("c1", "submit_plan", planSubmitArgs),
 		textTurn("Plan:\n1. Reproduce\n2. Fix"),
 		toolCallTurn("e1", "write_file", `{"path":"internal/calc/add.go"}`),
+		toolCallTurn("e1-todo", "todo_write", planExecTodosDone),
 		textTurn("Done — fixed."),
 		// Next turn, outside the window: the same writer must prompt again.
 		toolCallTurn("e2", "write_file", `{"path":"internal/calc/add_test.go"}`),
@@ -131,6 +145,7 @@ func TestPlanExecWindowStillGatesBash(t *testing.T) {
 		toolCallTurn("c1", "submit_plan", planSubmitArgs),
 		textTurn("Plan:\n1. Reproduce\n2. Fix"),
 		toolCallTurn("e1", "bash", `{"command":"go test ./internal/calc/"}`),
+		toolCallTurn("e1-todo", "todo_write", planExecTodosDone),
 		textTurn("Done — tests pass."),
 	}}
 	c, requested := execWindowController(t, prov, func(event.Approval) bool { return true }, bash)
@@ -153,6 +168,7 @@ func TestPlanExecWindowDeniedBashDoesNotRun(t *testing.T) {
 		toolCallTurn("c1", "submit_plan", planSubmitArgs),
 		textTurn("Plan:\n1. Reproduce\n2. Fix"),
 		toolCallTurn("e1", "bash", `{"command":"rm -rf build/"}`),
+		toolCallTurn("e1-todo", "todo_write", planExecTodosDone),
 		textTurn("Understood — stopping here."),
 	}}
 	c, requested := execWindowController(t, prov, func(a event.Approval) bool {
@@ -198,12 +214,11 @@ func TestPlanExecWindowClosesWhenExecutionTurnFails(t *testing.T) {
 		// The failing runner preempts the execution turn; these turns serve
 		// the post-failure turn instead.
 		toolCallTurn("e2", "write_file", `{"path":"internal/calc/add.go"}`),
+		toolCallTurn("e2-todo", "todo_write", planExecTodosDone),
 		textTurn("Wrote the fix."),
 	}}
 
-	reg := tool.NewRegistry()
-	reg.Add(&fakeTool{name: "submit_plan", readOnly: true})
-	reg.Add(fakePreviewableTool{writer})
+	reg := execWindowRegistry(fakePreviewableTool{writer})
 	b, sink := newBaselineEvents()
 	ag := agent.New(prov, reg, agent.NewSession(""), agent.Options{}, sink)
 	runner := &failingExecutionRunner{ag: ag, failAt: 2} // call 2 = the post-approval execution turn
