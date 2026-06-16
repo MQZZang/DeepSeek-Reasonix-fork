@@ -142,6 +142,7 @@ export interface AppBindings {
   ListTrashedSessions(): Promise<SessionMeta[]>;
   ResumeSession(path: string): Promise<HistoryMessage[]>;
   ResumeSessionForTab(tabID: string, path: string): Promise<HistoryMessage[]>;
+  OpenChannelSessionForTab(tabID: string, path: string): Promise<HistoryMessage[]>;
   PreviewSession(path: string): Promise<HistoryMessage[]>;
   DeleteSession(path: string): Promise<void>;
   RestoreSession(path: string): Promise<void>;
@@ -181,11 +182,11 @@ export interface AppBindings {
   ListDir(rel: string): Promise<DirEntry[]>;
   SearchFileRefs(query: string): Promise<DirEntry[]>;
   ReadFile(rel: string): Promise<FilePreview>;
-  WorkspaceChanges(): Promise<WorkspaceChangesView>;
+  WorkspaceChanges(tabID: string): Promise<WorkspaceChangesView>;
   GitBranches(): Promise<string[]>;
   GitCheckout(branch: string): Promise<void>;
-  WorkspaceGitHistory(path: string): Promise<GitCommitView[]>;
-  WorkspaceGitCommitDetail(hash: string, path: string): Promise<GitCommitDetailView>;
+  WorkspaceGitHistory(tabID: string, path: string): Promise<GitCommitView[]>;
+  WorkspaceGitCommitDetail(tabID: string, hash: string, path: string): Promise<GitCommitDetailView>;
   OpenWorkspacePath(rel: string): Promise<void>;
   RevealWorkspacePath(rel: string): Promise<void>;
   RevealPath(path: string): Promise<void>;
@@ -1722,6 +1723,10 @@ function makeMockApp(): AppBindings {
     async ResumeSessionForTab(_tabID: string, path: string) {
       return this.ResumeSession(path);
     },
+    async OpenChannelSessionForTab(tabID: string, path: string) {
+      mockTabs = mockTabs.map((tab) => tab.id === tabID ? { ...tab, sessionPath: path, readOnly: true } : tab);
+      return this.ResumeSession(path);
+    },
     async PreviewSession(path: string) {
       const s = sessions.find((x) => x.path === path) ?? trashedSessions.find((x) => x.path === path);
       return [
@@ -2103,7 +2108,7 @@ function makeMockApp(): AppBindings {
         binary: false,
       };
     },
-    async WorkspaceChanges() {
+    async WorkspaceChanges(_tabID: string) {
       return {
         gitAvailable: true,
         gitBranch: "main",
@@ -2127,12 +2132,12 @@ function makeMockApp(): AppBindings {
     async GitCheckout(_branch: string) {
       console.info("mock GitCheckout", _branch);
     },
-    async WorkspaceGitHistory(path: string) {
+    async WorkspaceGitHistory(_tabID: string, path: string) {
       return [
         { hash: "abcdef123456", author: "Mock Author", date: new Date().toISOString(), message: "Mock commit message for " + path },
       ];
     },
-    async WorkspaceGitCommitDetail(_hash: string, path: string) {
+    async WorkspaceGitCommitDetail(_tabID: string, _hash: string, path: string) {
       if (path) {
         return { diff: "--- a/mock\n+++ b/mock\n@@ -1,1 +1,1 @@\n-mock\n+mock diff" };
       }
@@ -2836,11 +2841,85 @@ function makeMockApp(): AppBindings {
         reasoningTokens: 7521,
         cacheHitTokens: 87000,
         cacheMissTokens: 13000,
-        requestCount: 6,
+        requestCount: 10,
         elapsedMs: 33 * 60 * 1000,
         sessionCost: 0.018,
-        sessionCurrency: "¥",
+        sessionCurrency: "$",
         sessionCostUsd: 0.018,
+        sources: {
+          executor: {
+            promptTokens: 24100,
+            completionTokens: 8300,
+            totalTokens: 32400,
+            reasoningTokens: 5200,
+            cacheHitTokens: 76000,
+            cacheMissTokens: 9000,
+            requestCount: 4,
+            sessionCost: 0.0124,
+            sessionCurrency: "$",
+            sessionCostUsd: 0.0124,
+          },
+          planner: {
+            promptTokens: 1800,
+            completionTokens: 600,
+            totalTokens: 2400,
+            reasoningTokens: 420,
+            cacheHitTokens: 3400,
+            cacheMissTokens: 700,
+            requestCount: 1,
+            sessionCost: 0.0011,
+            sessionCurrency: "$",
+            sessionCostUsd: 0.0011,
+          },
+          subagent: {
+            promptTokens: 4200,
+            completionTokens: 2100,
+            totalTokens: 6300,
+            reasoningTokens: 1500,
+            cacheHitTokens: 6100,
+            cacheMissTokens: 2100,
+            requestCount: 2,
+            sessionCost: 0.0032,
+            sessionCurrency: "$",
+            sessionCostUsd: 0.0032,
+          },
+          compaction: {
+            promptTokens: 2600,
+            completionTokens: 700,
+            totalTokens: 3300,
+            reasoningTokens: 260,
+            cacheHitTokens: 1100,
+            cacheMissTokens: 900,
+            requestCount: 1,
+            sessionCost: 0.0009,
+            sessionCurrency: "$",
+            sessionCostUsd: 0.0009,
+          },
+          classifier: {
+            promptTokens: 900,
+            completionTokens: 120,
+            totalTokens: 1020,
+            reasoningTokens: 70,
+            cacheHitTokens: 300,
+            cacheMissTokens: 250,
+            requestCount: 1,
+            sessionCost: 0.0003,
+            sessionCurrency: "$",
+            sessionCostUsd: 0.0003,
+          },
+          title: {
+            promptTokens: 420,
+            completionTokens: 80,
+            totalTokens: 500,
+            reasoningTokens: 20,
+            cacheHitTokens: 100,
+            cacheMissTokens: 50,
+            requestCount: 1,
+            sessionCost: 0.0001,
+            sessionCurrency: "$",
+            sessionCostUsd: 0.0001,
+          },
+        },
         mock: true,
         readFiles: [
           { path: "README.md", turn: 2, time: now - 34 * 60 * 1000 },

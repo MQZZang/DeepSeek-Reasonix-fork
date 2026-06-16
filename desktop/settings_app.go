@@ -691,7 +691,7 @@ func (a *App) rebuild() error {
 	prevPath := ""
 	if tab.Ctrl != nil {
 		prevPath = tab.Ctrl.SessionPath()
-		_ = tab.Ctrl.Snapshot()
+		_ = a.snapshotTab(tab)
 		carried = tab.Ctrl.History()
 		tab.Ctrl.Close()
 	}
@@ -890,6 +890,10 @@ func officialProviderTemplate(kind string) ([]config.ProviderEntry, string, erro
 			APIKeyEnv:     "DEEPSEEK_API_KEY",
 			BalanceURL:    "https://api.deepseek.com/user/balance",
 			ContextWindow: 1_000_000,
+			Prices: map[string]*provider.Pricing{
+				"deepseek-v4-flash": &provider.Pricing{CacheHit: 0.0028, Input: 0.14, Output: 0.28, Currency: "$"},
+				"deepseek-v4-pro":   &provider.Pricing{CacheHit: 0.003625, Input: 0.435, Output: 0.87, Currency: "$"},
+			},
 		}}, "DEEPSEEK_API_KEY", nil
 	case "mimo-api", "xiaomi-mimo", "xiaomi_mimo":
 		return []config.ProviderEntry{{
@@ -1058,8 +1062,9 @@ func (a *App) RemoveProviderAccess(name string) error {
 }
 
 type providerRemovalTab struct {
-	id   string
-	ctrl *control.Controller
+	id       string
+	ctrl     *control.Controller
+	readOnly bool
 }
 
 func providerAccessFallbackRef(c *config.Config, name string) string {
@@ -1124,7 +1129,7 @@ func (a *App) removeBuiltInProviderAccessAndRetargetTabs(name string) error {
 				a.mu.RUnlock()
 				return fmt.Errorf("finish or cancel active work using %q before removing the provider access", name)
 			}
-			affected = append(affected, providerRemovalTab{id: id, ctrl: tab.Ctrl})
+			affected = append(affected, providerRemovalTab{id: id, ctrl: tab.Ctrl, readOnly: tab.ReadOnly})
 		}
 		a.mu.RUnlock()
 	}
@@ -1139,7 +1144,9 @@ func (a *App) removeBuiltInProviderAccessAndRetargetTabs(name string) error {
 	}
 	for _, item := range affected {
 		if item.ctrl != nil {
-			_ = item.ctrl.Snapshot()
+			if !item.readOnly {
+				_ = item.ctrl.Snapshot()
+			}
 			item.ctrl.Close()
 		}
 	}
@@ -1198,7 +1205,7 @@ func (a *App) deleteProviderAndRetargetTabs(name string) error {
 			a.mu.RUnlock()
 			return fmt.Errorf("finish or cancel active work using %q before deleting the provider", name)
 		}
-		affected = append(affected, providerRemovalTab{id: id, ctrl: tab.Ctrl})
+		affected = append(affected, providerRemovalTab{id: id, ctrl: tab.Ctrl, readOnly: tab.ReadOnly})
 	}
 	a.mu.RUnlock()
 
@@ -1218,7 +1225,9 @@ func (a *App) deleteProviderAndRetargetTabs(name string) error {
 	}
 	for _, item := range affected {
 		if item.ctrl != nil {
-			_ = item.ctrl.Snapshot()
+			if !item.readOnly {
+				_ = item.ctrl.Snapshot()
+			}
 			item.ctrl.Close()
 		}
 	}

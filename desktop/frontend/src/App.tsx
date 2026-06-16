@@ -8,6 +8,7 @@ import { ScrollToPlugin } from "gsap/ScrollToPlugin";
 gsap.registerPlugin(useGSAP, Flip, ScrollToPlugin);
 import {
   Activity,
+  CircleHelp,
   Command,
   Download,
   SquarePen,
@@ -51,6 +52,7 @@ import { Tooltip } from "./components/Tooltip";
 import { StartupSplash, shouldShowStartupSplash } from "./components/StartupSplash";
 import { OnboardingOverlay } from "./components/OnboardingOverlay";
 import { AppChrome } from "./components/AppChrome";
+import { ShortcutsCheatsheet } from "./components/ShortcutsCheatsheet";
 import { ProjectTree } from "./components/ProjectTree";
 import { CopyButton } from "./components/CopyButton";
 import { parseTodos } from "./lib/tools";
@@ -108,8 +110,9 @@ import {
   type Theme,
 } from "./lib/theme";
 import { applyTextSize, DEFAULT_TEXT_SIZE, getTextSize, nextTextSize } from "./lib/textSize";
-import { useWindowStatePersistence } from "./lib/windowState";
+import { useViewportHeightVar, useWindowStatePersistence } from "./lib/windowState";
 import { availableWorkspacePanelWidth, resolveWorkspacePanelWidth, workspacePanelAriaMinWidth } from "./lib/workspaceLayout";
+import { useGlobalShortcut } from "./lib/keyboardShortcuts";
 import logoWordmark from "./assets/logo-wordmark.svg";
 
 const SIDEBAR_COLLAPSED_KEY = "reasonix.sidebar.collapsed";
@@ -163,6 +166,7 @@ type SidebarImConnection = {
   statusLabel: string;
   remoteId: string;
   sessionId: string;
+  sessionSource: string;
   scope: "global" | "project";
   workspaceRoot: string;
   allowAll: boolean;
@@ -313,6 +317,7 @@ function sidebarImQQConnection(bot: BotSettingsView, translate: Translator, runt
     statusLabel,
     remoteId,
     sessionId: "",
+    sessionSource: "",
     scope: "global",
     workspaceRoot: "",
     allowAll: bot.allowlist.allowAll,
@@ -339,6 +344,7 @@ function sidebarImConnectionsFromBot(
       const platformLabel = sidebarImPlatformLabel(platform, translate);
       const remoteId = mapping?.remoteId.trim() ?? "";
       const sessionId = mapping?.sessionId.trim() ?? "";
+      const sessionSource = mapping?.sessionSource.trim() ?? "";
       const scope = botMappingScope(mapping, connection.workspaceRoot);
       const workspaceRoot = botMappingWorkspaceRoot(mapping, connection.workspaceRoot);
       const status = sidebarImStatus(connection, bot.enabled);
@@ -363,6 +369,7 @@ function sidebarImConnectionsFromBot(
         statusLabel: sidebarImStatusLabel(status, translate),
         remoteId,
         sessionId,
+        sessionSource,
         scope,
         workspaceRoot,
         allowAll: bot.allowlist.allowAll,
@@ -393,6 +400,14 @@ function mappedSessionTarget(sessionId: string): { kind: "path" | "topic"; value
     return { kind: "path", value: trimmed };
   }
   return { kind: "topic", value: trimmed };
+}
+
+function sidebarImSessionTarget(connection: SidebarImConnection): { kind: "path" | "topic"; value: string } | null {
+  return mappedSessionTarget(connection.sessionId);
+}
+
+function isChannelSession(session: SessionMeta): boolean {
+  return session.kind === "channel" || session.sessionSource === "auto";
 }
 
 function sidebarImTopicSourcesFromBot(bot: BotSettingsView | null | undefined, translate: Translator): Record<string, SidebarImTopicSource> {
@@ -427,8 +442,11 @@ function sidebarImScopeLabel(connection: SidebarImConnection, translate: Transla
 }
 
 function sidebarImSessionLabel(connection: SidebarImConnection, translate: Translator): string {
-  const target = mappedSessionTarget(connection.sessionId);
-  if (!target) return translate("botDetail.noSession");
+  const target = sidebarImSessionTarget(connection);
+  if (!target) {
+    return connection.remoteId ? translate("botDetail.readOnlyChannel") : translate("botDetail.noSession");
+  }
+  if (connection.sessionSource === "auto") return translate("botDetail.readOnlyChannel");
   if (target.kind === "path") return target.value.split(/[\\/]/).pop() || target.value;
   return target.value;
 }
@@ -453,7 +471,7 @@ function sidebarImAccessStatusClass(connection: SidebarImConnection): string {
 
 function SidebarImConnectionDetail({ connection, onClose, onOpenSession, onOpenSettings, onManageAllowlist }: SidebarImConnectionDetailProps) {
   const translate = useT();
-  const target = mappedSessionTarget(connection.sessionId);
+  const target = sidebarImSessionTarget(connection);
   const accessStatusClass = sidebarImAccessStatusClass(connection);
   return (
     <div className="bot-detail">
@@ -779,37 +797,15 @@ function safeFilename(name: string): string {
 /** Global hotkey handler for shell-expand toggle (Ctrl/Cmd+B). */
 function ShellHotkeys() {
   const shellExpand = useShellExpand();
-  useEffect(() => {
-    if (!shellExpand) return;
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === "b") {
-        e.preventDefault();
-        shellExpand.toggleLast();
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [shellExpand]);
+  useGlobalShortcut("shell.toggle", () => shellExpand?.toggleLast(), [shellExpand], Boolean(shellExpand));
   return null;
 }
 
 /** Global hotkey handler for text-size shortcuts (Ctrl/Cmd + Plus/Minus/0). */
 function TextSizeHotkeys() {
-  useEffect(() => {
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey)) return;
-      if (e.key !== "+" && e.key !== "=" && e.key !== "-" && e.key !== "0") return;
-
-      e.preventDefault();
-      if (e.key === "0") {
-        applyTextSize(DEFAULT_TEXT_SIZE);
-        return;
-      }
-      applyTextSize(nextTextSize(getTextSize(), e.key === "-" ? -1 : 1));
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, []);
+  useGlobalShortcut("textSize.increase", () => applyTextSize(nextTextSize(getTextSize(), 1)));
+  useGlobalShortcut("textSize.decrease", () => applyTextSize(nextTextSize(getTextSize(), -1)));
+  useGlobalShortcut("textSize.reset", () => applyTextSize(DEFAULT_TEXT_SIZE));
   return null;
 }
 
@@ -833,6 +829,7 @@ export default function App() {
     listSessions,
     listTrashedSessions,
     resumeSession,
+    openChannelSession,
     previewSession,
     deleteSession,
     restoreSession,
@@ -871,6 +868,7 @@ export default function App() {
   const [startupUpdateChecksEnabled, setStartupUpdateChecksEnabled] = useState<boolean | null>(null);
   const [histView, setHistView] = useState<HistoryViewState | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [paletteSessions, setPaletteSessions] = useState<SessionMeta[]>([]);
   const { showToast } = useToast();
   const [sidebarImConnections, setSidebarImConnections] = useState<SidebarImConnection[]>([]);
@@ -954,6 +952,7 @@ export default function App() {
 
   // Persist window geometry across launches.
   useWindowStatePersistence();
+  useViewportHeightVar();
   useEffect(() => {
     document.documentElement.setAttribute("data-platform", desktopPlatform);
   }, [desktopPlatform]);
@@ -1864,15 +1863,23 @@ export default function App() {
     openWorkspacePanel("context");
   }, [closeWorkspacePanel, openWorkspacePanel, pulseWorkspaceToggle, workspacePanelRenderable]);
 
+  const clearWorkspaceRequests = useCallback(() => {
+    setWorkspaceRevealRequest(null);
+    setWorkspaceChangeRevealRequest(null);
+    setWorkspaceFileListRequest(null);
+    setWorkspaceChangeListRequest(null);
+  }, []);
+
+  useEffect(() => {
+    clearWorkspaceRequests();
+  }, [activeTabId, clearWorkspaceRequests]);
+
   const openRightDockMode = useCallback(
     (mode: RightDockMode) => {
-      setWorkspaceRevealRequest(null);
-      setWorkspaceChangeRevealRequest(null);
-      setWorkspaceFileListRequest(null);
-      setWorkspaceChangeListRequest(null);
+      clearWorkspaceRequests();
       openWorkspacePanel(mode);
     },
-    [openWorkspacePanel],
+    [clearWorkspaceRequests, openWorkspacePanel],
   );
 
   const openRightDockFile = useCallback(
@@ -1974,10 +1981,11 @@ export default function App() {
 
   const handleTabChange = useCallback(async (id: string) => {
     closeTransientOverlays();
+    clearWorkspaceRequests();
     const tabs = await switchTab(id);
     if (tabs) setTabMetas(tabs);
     setTabRevealSignal((signal) => signal + 1);
-  }, [closeTransientOverlays, switchTab]);
+  }, [clearWorkspaceRequests, closeTransientOverlays, switchTab]);
 
   const handleTabClose = useCallback(async (id: string) => {
     closeTransientOverlays();
@@ -2064,6 +2072,7 @@ export default function App() {
 
   // send wrapper: commits any pending optimistic rewind before sending.
   const commitThenSend = useCallback(async (displayText: string, submitText?: string) => {
+    if (activeTab?.readOnly) return;
     const rs = rewindStateRef.current;
     if (rs) {
       setRewindState(null);
@@ -2083,9 +2092,10 @@ export default function App() {
       }
     }
     send(displayText, submitText);
-  }, [send, rewind]);
+  }, [activeTab?.readOnly, send, rewind]);
 
   const handleMessageAction = useCallback((turn: number, scope: string) => {
+    if (activeTab?.readOnly) return;
     if (scope === "fork") {
       // Fork still goes through the controller (not optimistic).
       rewind(turn, scope).then(() => {
@@ -2134,7 +2144,7 @@ export default function App() {
     setComposerInsertRequest({ id: insertId, text: userItem?.text ?? "" });
 
     setRewindSignal((v) => v + 1);
-  }, [state.items, rewind, refreshTabMetas, setComposerInsertRequest]);
+  }, [activeTab?.readOnly, state.items, rewind, refreshTabMetas, setComposerInsertRequest]);
 
   const handleOpenTopic = useCallback(async (scope: string, workspaceRoot: string, topicId: string, sessionPath?: string) => {
     closeTransientOverlays();
@@ -2150,14 +2160,17 @@ export default function App() {
   }, [closeTransientOverlays, openGlobalTab, openProjectTab, openTopicSession, refreshTabMetas]);
 
   const openSidebarImConnectionSession = useCallback(async (connection: SidebarImConnection) => {
-    const target = mappedSessionTarget(connection.sessionId);
+    const target = sidebarImSessionTarget(connection);
     if (!target) {
       showToast(t("sidebar.imWaiting", { name: connection.title }));
       return;
     }
     setSidebarImDetailConnectionId("");
     try {
-      if (target.kind === "path") {
+      if (connection.sessionSource === "auto" && target.kind === "path") {
+        const tab = await ensureBlankTab(connection.scope, connection.scope === "project" ? connection.workspaceRoot : "");
+        await openChannelSession(target.value, tab.id);
+      } else if (target.kind === "path") {
         const tab = await ensureBlankTab(connection.scope, connection.scope === "project" ? connection.workspaceRoot : "");
         await resumeSession(target.value, tab.id);
       } else if (connection.scope === "project") {
@@ -2171,7 +2184,7 @@ export default function App() {
       console.warn("bot sidebar open failed", err);
       showToast(t("sidebar.imOpenFailed", { name: connection.title }));
     }
-  }, [ensureBlankTab, openGlobalTab, openProjectTab, refreshTabMetas, resumeSession, showToast, t]);
+  }, [ensureBlankTab, openChannelSession, openGlobalTab, openProjectTab, refreshTabMetas, resumeSession, showToast, t]);
 
   const selectSidebarImConnection = useCallback((connection: SidebarImConnection) => {
     setActiveSidebarImConnectionId(connection.id);
@@ -2215,7 +2228,10 @@ export default function App() {
       const scope = session.scope || (session.workspaceRoot ? "project" : "global");
       try {
         let targetTab: TabMeta;
-        if (scope === "project" && session.workspaceRoot && session.topicId) {
+        if (isChannelSession(session)) {
+          targetTab = await ensureBlankTab(scope === "project" ? "project" : "global", scope === "project" ? session.workspaceRoot || "" : "");
+          await openChannelSession(session.path, targetTab.id);
+        } else if (scope === "project" && session.workspaceRoot && session.topicId) {
           targetTab = await openProjectTab(session.workspaceRoot, session.topicId);
         } else if (scope === "global" && session.topicId) {
           targetTab = await openGlobalTab(session.topicId);
@@ -2225,7 +2241,9 @@ export default function App() {
             : (session.topicId ? "Missing workspaceRoot" : t("history.failedOpenSession")));
         }
         setHistView(null);
-        await resumeSession(session.path, targetTab.id);
+        if (!isChannelSession(session)) {
+          await resumeSession(session.path, targetTab.id);
+        }
         await refreshTabMetas();
       } catch (err: any) {
         setHistView(null);
@@ -2237,7 +2255,7 @@ export default function App() {
         }
       }
     },
-    [openGlobalTab, openProjectTab, refreshTabMetas, state.running, resumeSession, t, showToast],
+    [ensureBlankTab, openChannelSession, openGlobalTab, openProjectTab, refreshTabMetas, state.running, resumeSession, t, showToast],
   );
 
   // Command palette: ⌘K / Ctrl+K opens a fuzzy navigator over commands and
@@ -2248,21 +2266,22 @@ export default function App() {
     setPaletteOpen(true);
     setPaletteSessions(await listSessions().catch(() => []));
   }, [closeTransientOverlays, listSessions]);
-  useEffect(() => {
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setPaletteOpen((cur) => {
-          if (!cur) void openPalette();
-          return cur;
-        });
-      } else if (e.key === "Escape") {
-        setPaletteOpen(false);
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
+  useGlobalShortcut("commandPalette.open", () => {
+    setPaletteOpen((current) => {
+      if (!current) void openPalette();
+      return current;
+    });
   }, [openPalette]);
+  useGlobalShortcut("app.newSession", () => void handleNewTab(), [handleNewTab]);
+  useGlobalShortcut("settings.open", () => {
+    closeTransientOverlays();
+    setSettingsTarget("general");
+  }, [closeTransientOverlays]);
+  useGlobalShortcut("tab.close", () => {
+    if (activeTabId) void handleTabClose(activeTabId);
+  }, [activeTabId, handleTabClose], Boolean(activeTabId));
+  useGlobalShortcut("shortcuts.show", () => setShortcutsOpen(true));
+
   const paletteItems = useMemo<PaletteItem[]>(() => {
     const cmds: PaletteItem[] = [
       { id: "cmd-new", group: t("palette.group.commands"), title: t("palette.cmd.newSession"), icon: <SquarePen size={15} />, compact: true, keywords: ["new", "新建"], run: () => void handleNewTab() },
@@ -2576,6 +2595,9 @@ export default function App() {
           onNewTab={() => void handleNewTab()}
           onOpenPalette={() => void openPalette()}
         />
+        <a className="skip-to-composer" href="#composer-input">
+          {t("shortcuts.skipToComposer")}
+        </a>
 
         <aside className={sidebarClassName} aria-label={t("sidebar.navigation")}>
           {sidebarWorkbench ? (
@@ -2841,6 +2863,16 @@ export default function App() {
                   <span>{t("workspace.changedTab")}</span>
                 </button>
               </Tooltip>
+              <Tooltip label={t("shortcuts.cheatsheetTitle")}>
+                <button
+                  className="topicbar__action-btn topicbar__action-btn--icon topicbar__action-btn--utility"
+                  type="button"
+                  aria-label={t("shortcuts.cheatsheetTitle")}
+                  onClick={() => setShortcutsOpen(true)}
+                >
+                  <CircleHelp size={14} />
+                </button>
+              </Tooltip>
               <Tooltip label={t("topicBar.command")}>
                 <button
                   className="topicbar__action-btn topicbar__action-btn--label topicbar__action-btn--accent"
@@ -2879,12 +2911,13 @@ export default function App() {
               <Transcript
                 items={displayItems}
                 live={state.live}
+                tabId={activeTabId}
                 footerHeight={footerHeight}
                 onPrompt={commitThenSend}
                 onRewind={handleMessageAction}
                 checkpoints={state.checkpoints}
                 actionPending={state.messageAction != null}
-                rewindDisabled={state.running || state.messageAction != null || state.approval != null || state.ask != null || clearContextPending}
+                rewindDisabled={Boolean(activeTab?.readOnly) || state.running || state.messageAction != null || state.approval != null || state.ask != null || clearContextPending}
                 running={state.running}
                 rewindSignal={rewindSignal}
               />
@@ -2965,6 +2998,7 @@ export default function App() {
               onSetEffort={setEffort}
               onSetTokenMode={applyTokenMode}
               insertRequest={composerInsertRequest}
+              readOnly={Boolean(activeTab?.readOnly)}
               disabled={state.meta?.ready === false || state.messageAction != null || state.approval != null || state.ask != null || clearContextPending}
               decisionPending={state.messageAction != null || state.approval != null || state.ask != null || clearContextPending}
               ready={state.meta?.ready === true}
@@ -3077,6 +3111,7 @@ export default function App() {
               ) : (
                 <WorkspacePanel
                   open={workspacePanelRenderable}
+                  tabId={activeTabId}
                   cwd={state.meta?.cwd}
                   maximized={workspacePanelMaximized}
                   panelWidth={workspacePanelRenderWidth}
@@ -3143,6 +3178,13 @@ export default function App() {
         items={paletteItems}
         placeholder={t("palette.placeholder")}
         emptyText={t("palette.empty")}
+      />
+
+      <ShortcutsCheatsheet
+        open={shortcutsOpen}
+        platform={desktopPlatform}
+        onClose={() => setShortcutsOpen(false)}
+        t={t}
       />
 
       {startupSplashVisible && (

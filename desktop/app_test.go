@@ -790,6 +790,53 @@ func TestModelsForTabListsMimoAPIPaidAccess(t *testing.T) {
 	}
 }
 
+func TestModelsForTabKeepsUserProvidersWithProjectConfig(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	t.Setenv("DEEPSEEK_API_KEY", "sk-test")
+	t.Setenv("MIMO_API_KEY", "sk-test")
+
+	userCfg := config.Default()
+	userCfg.DefaultModel = "mimo-token-plan/mimo-v2.5-pro"
+	userCfg.Desktop.ProviderAccess = []string{"deepseek-flash", "mimo-pro"}
+	if err := userCfg.SaveTo(config.UserConfigPath()); err != nil {
+		t.Fatalf("save user config: %v", err)
+	}
+
+	projectRoot := t.TempDir()
+	projectConfig := `default_model = "deepseek-flash/deepseek-v4-flash"
+
+[desktop]
+provider_access = ["deepseek-flash"]
+
+[[providers]]
+name = "deepseek-flash"
+kind = "openai"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+`
+	if err := os.WriteFile(filepath.Join(projectRoot, "reasonix.toml"), []byte(projectConfig), 0o644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+
+	app := NewApp()
+	tab := &WorkspaceTab{ID: "project", WorkspaceRoot: projectRoot, Ready: true}
+	app.tabs = map[string]*WorkspaceTab{tab.ID: tab}
+	app.activeTabID = tab.ID
+
+	models := app.ModelsForTab(tab.ID)
+	refs := modelRefsFromView(models)
+	for _, want := range []string{
+		"deepseek/deepseek-v4-flash",
+		"mimo-token-plan/mimo-v2.5-pro",
+		"mimo-token-plan/mimo-v2.5",
+	} {
+		if !refs[want] {
+			t.Fatalf("ModelsForTab refs = %+v, missing %s", models, want)
+		}
+	}
+}
+
 func TestSetModelForTabRejectsProviderOutsideAccess(t *testing.T) {
 	isolateDesktopUserDirs(t)
 	t.Setenv("DEEPSEEK_API_KEY", "sk-test")
@@ -1727,6 +1774,100 @@ func TestDesktopSessionAPIsUseControllerSessionDir(t *testing.T) {
 	}
 	if titles := loadSessionTitles(dirB); len(titles) != 0 {
 		t.Fatalf("inactive workspace title sidecar should remain untouched, got %+v", titles)
+	}
+}
+
+func TestListSessionsMarksAutoBotSessionAsChannel(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+	path := filepath.Join(dir, "bot-channel.jsonl")
+	if err := os.WriteFile(path, []byte(`{"role":"user","content":"from channel"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+	cfg := config.Default()
+	cfg.Bot.Connections = []config.BotConnectionConfig{{
+		ID: "weixin-weixin", Provider: "weixin", Domain: "weixin", Label: "微信", Enabled: true, Status: "connected",
+		SessionMappings: []config.BotConnectionSessionMapping{{
+			RemoteID: "wx-chat-1", SessionID: "path:" + path, SessionSource: "auto",
+		}},
+	}}
+	if err := cfg.SaveTo(config.UserConfigPath()); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	app := NewApp()
+	app.setTestCtrl(control.New(control.Options{SessionDir: dir, SessionPath: filepath.Join(dir, "active.jsonl"), Label: "test"}), "")
+	defer app.activeCtrl().Close()
+
+	sessions := app.ListSessions()
+	if len(sessions) != 1 {
+		t.Fatalf("ListSessions len = %d, want 1: %+v", len(sessions), sessions)
+	}
+	got := sessions[0]
+	if got.Kind != "channel" || got.Channel != "weixin" || got.ChannelLabel != "微信" || got.RemoteID != "wx-chat-1" || got.SessionSource != "auto" {
+		t.Fatalf("channel session meta = %+v", got)
+	}
+}
+
+func TestOpenChannelSessionForTabIsReadOnly(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+	path := filepath.Join(dir, "bot-channel.jsonl")
+	if err := os.WriteFile(path, []byte(`{"role":"user","content":"from channel"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write session: %v", err)
+	}
+
+	app := NewApp()
+	ctrl := control.New(control.Options{SessionDir: dir, SessionPath: filepath.Join(dir, "active.jsonl"), Label: "test"})
+	app.setTestCtrl(ctrl, "")
+	defer app.activeCtrl().Close()
+
+	if _, err := app.OpenChannelSessionForTab("test", path); err != nil {
+		t.Fatalf("OpenChannelSessionForTab: %v", err)
+	}
+	if meta := app.tabMeta(app.activeTab(), true); !meta.ReadOnly {
+		t.Fatalf("channel tab should be read-only: %+v", meta)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read before: %v", err)
+	}
+	app.SubmitToTab("test", "must not append")
+	app.RunShellForTab("test", "echo must-not-run")
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("read-only channel transcript changed:\nbefore=%s\nafter=%s", before, after)
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open append: %v", err)
+	}
+	if _, err := f.WriteString(`{"role":"user","content":"external follow-up"}` + "\n"); err != nil {
+		f.Close()
+		t.Fatalf("append external message: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close append: %v", err)
+	}
+	app.snapshotAllTabs()
+	afterSnapshot, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read after snapshot: %v", err)
+	}
+	if !strings.Contains(string(afterSnapshot), "external follow-up") {
+		t.Fatalf("read-only channel snapshot overwrote external append:\n%s", afterSnapshot)
 	}
 }
 
