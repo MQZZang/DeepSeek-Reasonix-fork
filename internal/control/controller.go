@@ -31,9 +31,7 @@ import (
 
 	"reasonix/internal/agent"
 	"reasonix/internal/billing"
-	"reasonix/internal/builtinmcp"
 	"reasonix/internal/checkpoint"
-	"reasonix/internal/codegraph"
 	"reasonix/internal/command"
 	"reasonix/internal/config"
 	"reasonix/internal/diff"
@@ -65,6 +63,7 @@ type Controller struct {
 	policy   permission.Policy
 
 	label             string
+	modelRef          string
 	systemPrompt      string
 	sessionDir        string
 	host              *plugin.Host
@@ -130,6 +129,7 @@ type Controller struct {
 	mu         sync.Mutex
 	cancel     context.CancelFunc
 	running    bool
+	canceling  bool
 	autosaveWG sync.WaitGroup
 	// collabMode is the collaboration (intent) axis: CollabNormal, CollabPlan,
 	// or CollabAsk; "" reads as normal. Plan and ask both put the executor
@@ -217,6 +217,18 @@ type pendingAsk struct {
 	reply     chan []event.AskAnswer
 }
 
+// RuntimeStatus is the frontend-facing snapshot of foreground turn state. It is
+// intentionally more explicit than the legacy Running bool so UI code can
+// distinguish a cancellable foreground turn from pending prompts and background
+// jobs.
+type RuntimeStatus struct {
+	Running         bool
+	PendingPrompt   bool
+	BackgroundJobs  int
+	CancelRequested bool
+	Cancellable     bool
+}
+
 const (
 	ToolApprovalAsk  = "ask"
 	ToolApprovalAuto = "auto"
@@ -248,6 +260,7 @@ type Options struct {
 	Sink          event.Sink
 	Policy        permission.Policy
 	Label         string
+	ModelRef      string
 	SystemPrompt  string
 	SessionDir    string
 	SessionPath   string
@@ -313,6 +326,7 @@ func New(opts Options) *Controller {
 		sink:                   sink,
 		policy:                 opts.Policy,
 		label:                  opts.Label,
+		modelRef:               opts.ModelRef,
 		systemPrompt:           opts.SystemPrompt,
 		sessionDir:             opts.SessionDir,
 		sessionPath:            opts.SessionPath,
@@ -447,6 +461,7 @@ func (c *Controller) runGuarded(body func(ctx context.Context) error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cancel = cancel
 	c.running = true
+	c.canceling = false
 	c.mu.Unlock()
 
 	c.autosaveWG.Add(1)
@@ -461,6 +476,7 @@ func (c *Controller) runGuarded(body func(ctx context.Context) error) {
 				c.mu.Lock()
 				c.running = false
 				c.cancel = nil
+				c.canceling = false
 				c.mu.Unlock()
 				c.sink.Emit(event.Event{Kind: event.TurnDone, Err: fmt.Errorf("internal error: %v", r)})
 			}
@@ -469,6 +485,7 @@ func (c *Controller) runGuarded(body func(ctx context.Context) error) {
 		c.mu.Lock()
 		c.running = false
 		c.cancel = nil
+		c.canceling = false
 		c.mu.Unlock()
 		c.sink.Emit(event.Event{Kind: event.TurnDone, Err: explainError(err)})
 	}()
@@ -532,12 +549,14 @@ func (c *Controller) RunTurn(ctx context.Context, input string) error {
 	}
 	c.cancel = cancel
 	c.running = true
+	c.canceling = false
 	c.mu.Unlock()
 
 	defer func() {
 		c.mu.Lock()
 		c.running = false
 		c.cancel = nil
+		c.canceling = false
 		c.mu.Unlock()
 		cancel()
 	}()
@@ -1307,6 +1326,15 @@ func (c *Controller) Run(ctx context.Context, input string) error {
 func (c *Controller) Cancel() {
 	c.mu.Lock()
 	cancel := c.cancel
+	if cancel != nil {
+		c.canceling = true
+		for id := range c.approvals {
+			delete(c.approvals, id)
+		}
+		for id := range c.asks {
+			delete(c.asks, id)
+		}
+	}
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -1326,6 +1354,23 @@ func (c *Controller) PendingPrompt() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return len(c.approvals) > 0 || len(c.asks) > 0
+}
+
+// RuntimeStatus reports the active work owned by the foreground controller.
+func (c *Controller) RuntimeStatus() RuntimeStatus {
+	c.mu.Lock()
+	running := c.running
+	pending := len(c.approvals) > 0 || len(c.asks) > 0
+	canceling := c.canceling
+	c.mu.Unlock()
+	backgroundJobs := len(c.Jobs())
+	return RuntimeStatus{
+		Running:         running,
+		PendingPrompt:   pending,
+		BackgroundJobs:  backgroundJobs,
+		CancelRequested: canceling,
+		Cancellable:     running || pending,
+	}
 }
 
 // Turn returns the current turn number (0 before the first submit).
@@ -1866,6 +1911,9 @@ func removeSessionArtifacts(path string) error {
 	if path == "" {
 		return nil
 	}
+	if err := jobs.RemoveArtifacts(path); err != nil {
+		return err
+	}
 	for _, p := range []string{path, agent.BranchMetaPath(path)} {
 		if p == "" {
 			continue
@@ -2338,6 +2386,7 @@ func (c *Controller) autosaveWhileRunning(ctx context.Context) {
 func (c *Controller) snapshot(markActivity bool) error {
 	c.mu.Lock()
 	path := c.sessionPath
+	modelRef := c.modelRef
 	c.mu.Unlock()
 	if c.executor == nil || path == "" {
 		return nil
@@ -2353,6 +2402,11 @@ func (c *Controller) snapshot(markActivity bool) error {
 	}
 	if err := s.Save(path); err != nil {
 		return err
+	}
+	if strings.TrimSpace(modelRef) != "" {
+		if err := agent.SetBranchModelPreserveUpdated(path, modelRef); err != nil {
+			return err
+		}
 	}
 	if markActivity {
 		return agent.TouchBranchMeta(path)
@@ -2428,7 +2482,7 @@ func (c *Controller) IsDestroyingSession(sessionPath string) bool {
 
 func (c *Controller) setActiveJobSession(sessionPath string) {
 	if c.jobs != nil {
-		c.jobs.SetActiveSession(agent.BranchID(sessionPath))
+		c.jobs.SetActiveSessionPath(agent.BranchID(sessionPath), sessionPath)
 	}
 }
 
@@ -2664,7 +2718,7 @@ func (c *Controller) ConnectMCPServer(e config.PluginEntry) (int, error) {
 
 func (c *Controller) connectMCPServer(e config.PluginEntry) (int, error) {
 	exp := e.ExpandedPlugin()
-	return c.connectMCPSpec(plugin.Spec{
+	return c.connectMCPSpec(plugin.ApplyKnownOverrides(plugin.Spec{
 		Name:    exp.Name,
 		Type:    exp.Type,
 		Command: exp.Command,
@@ -2672,7 +2726,7 @@ func (c *Controller) connectMCPServer(e config.PluginEntry) (int, error) {
 		Env:     exp.Env,
 		URL:     exp.URL,
 		Headers: exp.Headers,
-	})
+	}, c.WorkspaceRoot()))
 }
 
 func (c *Controller) connectMCPSpec(s plugin.Spec) (int, error) {
@@ -2783,60 +2837,7 @@ func (c *Controller) ConnectConfiguredMCPServer(name string) (int, error) {
 			return c.connectMCPServer(p)
 		}
 	}
-	if name == "codegraph" {
-		return c.connectCodegraphMCPServer(cfg)
-	}
-	if p, ok := builtinmcp.Entry(name); ok {
-		return c.connectMCPServer(p)
-	}
 	return 0, fmt.Errorf("no configured MCP server named %q", name)
-}
-
-// ConnectCodegraphMCPServer connects the built-in CodeGraph server using an
-// already-resolved config. Desktop uses this after saving user-level settings so
-// a stale project config cannot override the just-applied choice.
-func (c *Controller) ConnectCodegraphMCPServer(cfg *config.Config) (int, error) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return 0, err
-	}
-	return c.ConnectCodegraphMCPServerForRoot(cfg, cwd)
-}
-
-// ConnectCodegraphMCPServerForRoot connects CodeGraph pinned to root. Desktop
-// project tabs use this after hot updates so a reconnect keeps the same project
-// scope as boot-time CodeGraph startup.
-func (c *Controller) ConnectCodegraphMCPServerForRoot(cfg *config.Config, root string) (int, error) {
-	return c.connectCodegraphMCPServerForRoot(cfg, root)
-}
-
-func (c *Controller) connectCodegraphMCPServer(cfg *config.Config) (int, error) {
-	return c.ConnectCodegraphMCPServer(cfg)
-}
-
-func (c *Controller) connectCodegraphMCPServerForRoot(cfg *config.Config, root string) (int, error) {
-	if !cfg.Codegraph.Enabled {
-		return 0, fmt.Errorf("codegraph is disabled in config")
-	}
-	bin, ok := codegraph.Resolve(cfg.Codegraph.Path)
-	if !ok {
-		return 0, fmt.Errorf("codegraph is not installed")
-	}
-	root = strings.TrimSpace(root)
-	if root == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return 0, err
-		}
-		root = cwd
-	}
-	if !codegraph.IndexableRoot(root) {
-		return 0, fmt.Errorf("codegraph: refusing to index %q — a filesystem root would index the whole volume", root)
-	}
-	if err := codegraph.EnsureInit(c.pluginCtx, bin, root); err != nil {
-		return 0, fmt.Errorf("codegraph init: %w", err)
-	}
-	return c.connectMCPSpec(codegraph.MCPSpec(bin, root))
 }
 
 // RemoveMCPServer disconnects a live MCP server — its tools vanish from the next

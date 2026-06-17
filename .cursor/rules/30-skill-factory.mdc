@@ -1,0 +1,64 @@
+---
+description: >-
+  Use when the user asks to create a new skill, templatize a workflow,
+  capture reusable prompts, or generate portable capability packs for
+  Cursor / Claude / Codex agents.
+alwaysApply: false
+---
+
+# Skill Factory
+
+Guidelines for creating and maintaining Agent Skills and related rules in this repository.
+
+## When to Create a Skill
+
+Create a skill **only** when ALL apply:
+
+- **High frequency** — The workflow recurs across sessions or teammates.
+- **Reusable** — Steps are stable, not one-off context.
+- **Process-stable** — A checklist or sequence helps more than ad-hoc chat.
+
+**Do not** create a skill for:
+
+- One-time tasks
+- Pure project facts (use `.ai/knowledge/` instead)
+- Single universal principles (use `.cursor/rules/` with `alwaysApply`)
+
+## Required Skill Contents
+
+Every new skill directory must include `SKILL.md` with:
+
+1. **使用场景** — Clear triggers (when to use).
+2. **禁用场景** — When NOT to use (avoids skill sprawl).
+3. **操作流程** — Ordered steps the agent must follow.
+4. **验收标准** — How to know the skill was applied correctly.
+5. **失败模式** — Common mistakes and how to recover.
+
+## Evaluation Cases (Minimum 3)
+
+Document in the skill or companion file:
+
+| Case | Purpose |
+|------|---------|
+| Happy path | Standard successful run |
+| Ambiguous case | Missing info; agent must ask or assume explicitly |
+| Boundary / failure | Error handling, scope limit, or rejection |
+
+## Rule vs Skill vs Knowledge
+
+| Artifact | Use for |
+|----------|---------|
+| `.cursor/rules/*.mdc` | Always-on or description-triggered guardrails |
+| `.cursor/skills/*/SKILL.md` | Multi-step procedural workflows |
+| `.ai/knowledge/*.md` | Project facts, patterns, lessons (reference) |
+
+## Anti-Hallucination
+
+- Abstract patterns only — **no** leaked or proprietary system prompt text.
+- Skills must reference repo paths and commands that exist or are marked TODO.
+- Prefer linking to `.ai/knowledge/prompt-patterns.md` for generic patterns.
+
+## Maintenance
+
+- Remove or merge skills that duplicate rules or each other.
+- Update eval cases when the workflow changes.

@@ -1,0 +1,110 @@
+---
+description: >-
+  Use when the user asks to implement, fix, refactor, debug, review code,
+  modify multiple files, or automate project workflows. Enforces Ask → Plan →
+  Code → QA phases with structured outputs.
+alwaysApply: false
+---
+
+# Ask → Plan → Code → QA Workflow
+
+Apply this rule for non-trivial implementation work. Trivial one-line fixes in a single file may skip Plan if the user explicitly asks for speed — but Code and QA still apply.
+
+## Phase 1: Ask
+
+Before planning or coding:
+
+- Clarify goal, constraints, and definition of done.
+- List **assumptions** and open questions.
+- Challenge flawed approaches with evidence, not opinion alone.
+- Confirm scope boundaries and non-goals when unclear.
+
+**Output (brief):** Goal restatement, assumptions, questions, and whether to proceed to Plan.
+
+## Phase 2: Plan
+
+Produce a written plan before multi-file or risky changes. Use this structure:
+
+### Plan Template
+
+```markdown
+## Goal
+<What success looks like>
+
+## Context
+<Relevant files, systems, prior state>
+
+## Assumptions
+<What you are treating as true without proof>
+
+## Non-goals
+<Explicitly out of scope>
+
+## Proposed Approach
+<High-level strategy and why>
+
+## Execution Steps
+1. ...
+2. ...
+
+## Files to Inspect
+- path/to/file — reason
+
+## Impact Scope
+<APIs, types, configs, users affected>
+
+## Risks
+<What could go wrong>
+
+## Acceptance Criteria
+- [ ] ...
+
+## QA Plan
+<Commands and checks to run after implementation>
+
+## Pause Conditions
+<When to stop and ask the user>
+```
+
+Do not start Code until the plan is proportionate to the task (mental plan is OK only for truly trivial edits).
+
+## Phase 3: Code
+
+- Re-read files immediately before editing.
+- Search references when changing contracts (API, types, paths, schemas).
+- Minimal diff; match existing conventions.
+- One logical change at a time when debugging — verify between steps.
+
+## Phase 4: QA
+
+After implementation, report results using this structure:
+
+### QA Template
+
+```markdown
+## Summary
+<One paragraph: what was done and outcome>
+
+## Changed Files
+- path — brief change
+
+## Verification Performed
+<What you actually ran or checked>
+
+## Passing Evidence
+<Commands, outputs, or file evidence for success>
+
+## Failing Evidence
+<Failures with logs or reproduction steps>
+
+## Not Verified
+<Anything not run or not confirmed>
+
+## Remaining Risks
+<Residual uncertainty or follow-ups>
+
+## Next Step
+<Recommended follow-up, if any>
+```
+
+Never omit **Not Verified** when checks were skipped.

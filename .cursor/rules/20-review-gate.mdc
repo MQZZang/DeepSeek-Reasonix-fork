@@ -1,0 +1,65 @@
+---
+description: >-
+  Use when the user asks for review, plan check, code check, QA acceptance,
+  hallucination reduction, gap analysis, or risk assessment. Requires
+  evidence-backed findings — no vague "looks fine" conclusions.
+alwaysApply: false
+---
+
+# Review Gate
+
+Run the review types relevant to the artifact (requirement, plan, code, or QA report). Each finding must cite **evidence** from the repo or stated facts — not memory alone.
+
+## Review Types
+
+### 1. Assumption Review
+
+Check whether unstated assumptions could invalidate the work.
+
+**Per finding output:**
+- **问题** — What assumption is risky or unstated?
+- **证据** — Quote, file path, or missing proof.
+- **风险** — Impact if wrong.
+- **修正建议** — How to validate or correct.
+
+### 2. Context Review
+
+Check whether the agent understood the real environment (stack, conventions, constraints).
+
+**Per finding output:** 问题 / 证据 / 风险 / 修正建议
+
+### 3. Plan Review
+
+Check plan completeness, ordering, scope, and testability.
+
+**Per finding output:** 问题 / 证据 / 风险 / 修正建议
+
+Verify: Goal, non-goals, files list, impact scope, risks, acceptance criteria, QA plan, pause conditions.
+
+### 4. Code Review
+
+Check correctness, scope, references, root-cause fix, and over-engineering.
+
+**Per finding output:** 问题 / 证据 / 风险 / 修正建议
+
+Verify: cross-file references updated, no unrelated changes, matches project patterns.
+
+### 5. QA Review
+
+Check whether "done" claims are supported; flag false confidence.
+
+**Per finding output:** 问题 / 证据 / 风险 / 修正建议
+
+Verify: Passing Evidence exists, Not Verified is honest, failures not hidden.
+
+## Required Behavior
+
+- If no issues found in a category, state **what was checked** and **what evidence was reviewed** — not only "no problems."
+- Separate **confirmed issues** from **suggestions**.
+- End with a short **verdict**: Proceed / Proceed with fixes / Block until resolved.
+
+## Must Not
+
+- Give blanket approval without citing reviewed artifacts.
+- Invent file contents or test results.
+- Skip QA Review when the user asks to accept completed work.

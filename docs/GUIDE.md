@@ -12,6 +12,7 @@
 ## Contents
 
 - [Configuration](#configuration)
+- [Configuration paths](./CONFIG_PATHS.md)
 - [Reasoning language](./REASONING_LANGUAGE.md)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Permissions & sandbox](#permissions--sandbox)
@@ -23,10 +24,15 @@
 ## Configuration
 
 Resolution order: **flag > `./reasonix.toml` > the user config file >
-built-in defaults**. The user config lives in your OS config dir: `~/.config/reasonix/`
-on Linux, `~/Library/Application Support/reasonix/` on macOS, `%AppData%\reasonix\` on
-Windows. Secrets come from the environment via `api_key_env` and are
-never stored in config files.
+built-in defaults**. Starting with **Reasonix v1.8.1**, the user config lives at
+`~/.reasonix/config.toml` on macOS/Linux and
+`%AppData%\reasonix\config.toml` on Windows; see
+[Configuration paths](./CONFIG_PATHS.md) for migration and related data paths.
+Secrets come from the environment via `api_key_env` and are never stored in
+config files. Credentials default to `credentials_store = "auto"`, which prefers
+the OS credential store and falls back to the file under Reasonix home. New keys
+saved by Reasonix are not written to a project `.env`; project `.env` files are
+only read for compatibility and explicit per-project overrides.
 
 For the desktop and CLI usage of visible reasoning language, see
 [Reasoning language](./REASONING_LANGUAGE.md).
@@ -130,6 +136,8 @@ Menus and controls:
 | `Enter` / `Tab` in those menus | Accepts the highlighted item | Directory-like entries can keep the menu open for the next level. |
 | `Esc` in those menus | Closes the current menu or returns from past-chat search | Regular typing continues after the menu closes. |
 | Ask / Auto / YOLO approval controls | Picks the tool approval posture directly | Clicking these controls is unchanged by keyboard shortcuts. |
+| Tool approval card | `Left` / `Right`, `Enter`, `1`-`4`, `Esc` | Move the highlighted action, confirm it, pick a numbered action, or deny. The default highlighted action is Allow once. |
+| Plan approval card | `Left` / `Right`, `Enter`, `1`-`3`, `Esc` | Move between Revise plan, Start execution, and Exit plan. The default highlighted action is Start execution. |
 | Plan control | Toggles Plan on/off | Same mode as `Shift+Tab`. |
 | Goal item in the collaboration menu | Starts, views, or clears Goal | Goal is not in any keyboard cycle. |
 
@@ -194,7 +202,7 @@ Permissions gate each tool call: `deny` > `ask` > `allow` > fallback. Bash and
 file mutation tools require approval by default; read-only tools generally do
 not. Approvals are stored and matched as permission rules, not button labels:
 for example `Bash(npm run build)`, `Bash(npm run test:*)`, and `Edit(docs/**)`.
-`reasonix chat` can grant Bash as an exact command or as a conservative command
+`reasonix` can grant Bash as an exact command or as a conservative command
 prefix (for example `Bash(go test:*)`), while file-editing tools share session
 edit grants and persist path-scoped rules such as `Edit(src/app.go)`.
 `reasonix run` stays autonomous but still honours `deny`.
@@ -265,7 +273,7 @@ convenient.
 
 ## Slash commands
 
-In `reasonix chat`, built-in commands (`/compact`, `/new`, `/clear`, `/rewind`,
+In an interactive `reasonix` session, built-in commands (`/compact`, `/new`, `/clear`, `/rewind`,
 `/tree`, `/branch`, `/switch`, `/todo`, `/model`, `/mcp`, `/skills`, `/hooks`,
 `/memory`, `/output-style`, `/sandbox`, `/language`, `/auto-plan`,
 `/reasoning-language`, `/help`) run
@@ -275,7 +283,7 @@ discards the current context without saving it. `/tree` shows saved conversation
 branches, `/branch [name]` forks the current conversation tip, `/branch <turn>
 [name]` forks from an earlier checkpointed turn, and `/switch <id|name>` loads
 another branch. **Custom commands** are Markdown files under `.reasonix/commands/`
-(project) or `~/.config/reasonix/commands/` (user) — `review.md` becomes
+(project) or `~/.reasonix/commands/` (user) — `review.md` becomes
 `/review`, a subdirectory namespaces it (`git/commit.md` → `/git:commit`). The
 body is a prompt template; invoking the command sends it as a turn.
 
@@ -355,9 +363,9 @@ snapshotted into that checkpoint), while shell commands and other
 side-effecting tools keep their normal approval prompts. `auto_plan_classifier` can
 name a cheap provider such as `deepseek-flash`; it is only called for borderline
 inputs and falls back to the heuristic if classification fails. Use
-`/auto-plan off|on` in `reasonix chat` to change the user-level setting, or
+`/auto-plan off|on` inside `reasonix` to change the user-level setting, or
 `reasonix config auto-plan off|on` from a shell/script. The visible reasoning
-language uses the same shape: `/reasoning-language auto|zh|en` in chat, or
+language uses the same shape: `/reasoning-language auto|zh|en` in the session, or
 `reasonix config reasoning-language auto|zh|en` in a shell/script. Pass
 `--local` to the shell command only when you intentionally want a project-local
 override.

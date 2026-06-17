@@ -27,6 +27,7 @@ type BranchMeta struct {
 	WorkspaceRoot    string    `json:"workspace_root,omitempty"`
 	TopicID          string    `json:"topic_id,omitempty"`
 	TopicTitle       string    `json:"topic_title,omitempty"`
+	Model            string    `json:"model,omitempty"`
 	// Goal carries the session's in-flight goal (objective text, status, and
 	// progress counters) so a long-running objective survives restart/resume.
 	// nil when the session has no active goal; omitted from JSON so metas
@@ -247,4 +248,32 @@ func RenameSession(sessionPath string, title string) error {
 	}
 	m.TopicTitle = title
 	return SaveBranchMeta(sessionPath, m)
+}
+
+// LoadSessionModel reads the canonical provider/model ref saved beside a
+// session transcript.
+func LoadSessionModel(sessionPath string) (string, bool) {
+	meta, ok, err := LoadBranchMeta(sessionPath)
+	if err != nil || !ok {
+		return "", false
+	}
+	model := strings.TrimSpace(meta.Model)
+	if model == "" {
+		return "", false
+	}
+	return model, true
+}
+
+// SetBranchModelPreserveUpdated stores the canonical provider/model ref without
+// changing the session activity timestamp.
+func SetBranchModelPreserveUpdated(sessionPath, model string) error {
+	if sessionPath == "" {
+		return fmt.Errorf("empty session path")
+	}
+	meta, err := EnsureBranchMeta(sessionPath)
+	if err != nil {
+		return err
+	}
+	meta.Model = strings.TrimSpace(model)
+	return SaveBranchMetaPreserveUpdated(sessionPath, meta)
 }
