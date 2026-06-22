@@ -678,30 +678,30 @@ func TestCoordinatorSetPlanModePropagates(t *testing.T) {
 
 	coord := NewCoordinator(prov, plannerSess, nil, plannerTools, Options{MaxSteps: 2}, exec, 0, event.Discard, nil)
 
-	// Both should start with planMode=false
-	if coord.plannerAgent.planMode.Load() {
-		t.Error("planner should start with planMode=false")
+	// Both should start with full capability.
+	if coord.plannerAgent.Ceiling() != CeilingFull {
+		t.Error("planner should start with CeilingFull")
 	}
-	if coord.executor.planMode.Load() {
-		t.Error("executor should start with planMode=false")
+	if coord.executor.Ceiling() != CeilingFull {
+		t.Error("executor should start with CeilingFull")
 	}
 
 	// SetPlanMode(true) should propagate to both
 	coord.SetPlanMode(true)
-	if !coord.plannerAgent.planMode.Load() {
-		t.Error("planner should have planMode=true after SetPlanMode(true)")
+	if coord.plannerAgent.Ceiling() != CeilingReadOnly {
+		t.Error("planner should have CeilingReadOnly after SetPlanMode(true)")
 	}
-	if !coord.executor.planMode.Load() {
-		t.Error("executor should have planMode=true after SetPlanMode(true)")
+	if coord.executor.Ceiling() != CeilingReadOnly {
+		t.Error("executor should have CeilingReadOnly after SetPlanMode(true)")
 	}
 
 	// SetPlanMode(false) should propagate to both
 	coord.SetPlanMode(false)
-	if coord.plannerAgent.planMode.Load() {
-		t.Error("planner should have planMode=false after SetPlanMode(false)")
+	if coord.plannerAgent.Ceiling() != CeilingFull {
+		t.Error("planner should have CeilingFull after SetPlanMode(false)")
 	}
-	if coord.executor.planMode.Load() {
-		t.Error("executor should have planMode=false after SetPlanMode(false)")
+	if coord.executor.Ceiling() != CeilingFull {
+		t.Error("executor should have CeilingFull after SetPlanMode(false)")
 	}
 }
 

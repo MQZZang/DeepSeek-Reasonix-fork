@@ -237,9 +237,7 @@ func TestPlanExecWindowClosesWhenExecutionTurnFails(t *testing.T) {
 	if err := runTurnErr(t, c, "plan and fix the add bug"); !errors.Is(err, errFakeBoom) {
 		t.Fatalf("turn error = %v, want errFakeBoom from the execution turn", err)
 	}
-	c.mu.Lock()
-	window := c.approvedPlanAutoApproveTools
-	c.mu.Unlock()
+	window := c.approval.planAutoApproveActive()
 	if window {
 		t.Fatal("execution window must reset when the execution turn fails")
 	}
