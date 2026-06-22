@@ -46,6 +46,7 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 
 	b.WriteString("# Reasonix configuration.\n")
 	fmt.Fprintf(&b, "# Resolution order: flag > ./reasonix.toml > %s > built-in defaults.\n", userConfigDisplayPath())
+	b.WriteString("# Fields marked user/global only are not overridden by ./reasonix.toml.\n")
 	b.WriteString("# Secrets come from the environment via api_key_env; never put keys here.\n\n")
 
 	fmt.Fprintf(&b, "config_version = %d   # schema marker for diagnostics; old versions may ignore it\n", configVersion(c))
@@ -91,7 +92,7 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 		} else {
 			b.WriteString("# language = \"zh\"   # desktop UI language; empty/auto = browser/OS auto-detect\n")
 		}
-		fmt.Fprintf(&b, "layout_style = %q   # desktop layout: classic|workbench\n", c.DesktopLayoutStyle())
+		fmt.Fprintf(&b, "layout_style = %q   # desktop layout: classic|workbench|creation\n", c.DesktopLayoutStyle())
 		fmt.Fprintf(&b, "theme = %q   # desktop only: auto|dark|light\n", c.DesktopTheme())
 		if style := c.DesktopThemeStyle(); style != "" {
 			fmt.Fprintf(&b, "theme_style = %q   # desktop accent palette\n", style)
@@ -108,6 +109,7 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 			fmt.Fprintf(&b, "provider_access = %s   # desktop settings: providers shown on Settings > Model > Access\n", renderStringArray(c.Desktop.ProviderAccess))
 		}
 		fmt.Fprintf(&b, "expand_thinking = %v   # desktop: show reasoning text expanded by default; false = collapsed\n", c.Desktop.ExpandThinking)
+		fmt.Fprintf(&b, "display_mode = %q   # desktop: standard|compact transcript display mode\n", c.DesktopDisplayMode())
 		b.WriteString("\n")
 
 		b.WriteString("[notifications]\n")
@@ -173,25 +175,29 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	} else {
 		b.WriteString("# system_prompt_file = \"prompts/system.md\"   # overrides system_prompt when set\n")
 	}
-	if c.Agent.MaxSteps != defaults.Agent.MaxSteps {
-		fmt.Fprintf(&b, "max_steps         = %d   # executor tool-call rounds; 0 = no limit\n", c.Agent.MaxSteps)
-	} else {
-		b.WriteString("# max_steps         = 0   # executor tool-call rounds; 0 = no limit\n")
-	}
-	if c.Agent.PlannerMaxSteps != defaults.Agent.PlannerMaxSteps {
-		fmt.Fprintf(&b, "planner_max_steps = %d   # planner read-only tool-call rounds; 0 = no limit\n", c.Agent.PlannerMaxSteps)
-	} else {
-		b.WriteString("# planner_max_steps = 12   # planner read-only tool-call rounds; 0 = no limit\n")
+	if scope != RenderScopeProject {
+		if c.Agent.MaxSteps != defaults.Agent.MaxSteps {
+			fmt.Fprintf(&b, "max_steps         = %d   # executor tool-call rounds; 0 = no limit\n", c.Agent.MaxSteps)
+		} else {
+			b.WriteString("# max_steps         = 0   # executor tool-call rounds; 0 = no limit\n")
+		}
+		if c.Agent.PlannerMaxSteps != defaults.Agent.PlannerMaxSteps {
+			fmt.Fprintf(&b, "planner_max_steps = %d   # planner read-only tool-call rounds; 0 = no limit\n", c.Agent.PlannerMaxSteps)
+		} else {
+			b.WriteString("# planner_max_steps = 0    # planner read-only tool-call rounds; 0 = no limit\n")
+		}
 	}
 	fmt.Fprintf(&b, "temperature       = %s\n", formatFloat(c.Agent.Temperature))
-	autoPlan := c.Agent.AutoPlan
-	switch strings.ToLower(strings.TrimSpace(autoPlan)) {
-	case "on", "ask":
-		autoPlan = "on"
-	default:
-		autoPlan = "off"
+	if scope != RenderScopeProject {
+		autoPlan := c.Agent.AutoPlan
+		switch strings.ToLower(strings.TrimSpace(autoPlan)) {
+		case "on", "ask":
+			autoPlan = "on"
+		default:
+			autoPlan = "off"
+		}
+		fmt.Fprintf(&b, "auto_plan   = %q   # user-level only: off|on; off keeps plan mode manual\n", autoPlan)
 	}
-	fmt.Fprintf(&b, "auto_plan   = %q   # off|on; off keeps plan mode manual\n", autoPlan)
 	if lang := c.ReasoningLanguage(); lang != "auto" {
 		fmt.Fprintf(&b, "reasoning_language = %q   # visible reasoning language: auto|zh|en\n", lang)
 	} else {
@@ -219,7 +225,7 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	if c.Agent.PlannerModel != "" {
 		fmt.Fprintf(&b, "planner_model = %q   # low-frequency planner (two-model collaboration)\n", c.Agent.PlannerModel)
 	} else {
-		b.WriteString("# planner_model = \"mimo\"   # optional: enable two-model collaboration\n")
+		b.WriteString("# planner_model = \"deepseek-pro\"   # optional: enable two-model collaboration\n")
 	}
 	if c.Agent.SubagentModel != "" {
 		fmt.Fprintf(&b, "subagent_model = %q   # default model for runAs=subagent skills\n", c.Agent.SubagentModel)
@@ -583,13 +589,14 @@ func projectScopedConfigForRender(c *Config) *Config {
 		return c
 	}
 	cp := *c
-	cp.Providers = make([]ProviderEntry, 0, len(c.Providers))
+	cp.Providers = make([]ProviderEntry, 0, len(c.Providers)+len(c.shadowedProjectProviders))
 	for _, p := range c.Providers {
 		if c.providerSources[providerMergeKey(p)] == providerSourceUser {
 			continue
 		}
 		cp.Providers = append(cp.Providers, p)
 	}
+	cp.Providers = append(cp.Providers, c.shadowedProjectProviders...)
 	return &cp
 }
 

@@ -1,11 +1,10 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent, type ReactNode } from "react";
-import { QRCodeSVG } from "qrcode.react";
+import { lazy, memo, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent, type ReactNode } from "react";
 import { Check, CheckCircle2, ChevronDown, ChevronUp, Clipboard, GripVertical, KeyRound, Loader2, Play, QrCode, RefreshCw, Send } from "lucide-react";
 import { asArray } from "../lib/array";
 import { useDeferredClose } from "../lib/useMountTransition";
 import { app } from "../lib/bridge";
 import { normalizeLangPref, useI18n, useT, type DictKey, type LangPref } from "../lib/i18n";
-import { inferredVisionModels, mergedFetchedProviderModels, providerDefaultModel, providerModelCandidates } from "../lib/providerModels";
+import { apiKeyEnvFromProviderName, inferredVisionModels, mergedFetchedProviderModels, providerApiKeyEnvForSave, providerDefaultModel, providerIsConfigured, providerModelCandidates, providerRequiresKey } from "../lib/providerModels";
 import { useUpdater } from "../lib/useUpdater";
 import {
   THEME_STYLES,
@@ -49,8 +48,6 @@ import type { BotAllowlistView, BotConnectionDiagnostic, BotConnectionView, BotI
 import { InlineConfirmButton } from "./InlineConfirmButton";
 import { Tooltip } from "./Tooltip";
 import { AnchoredPopover } from "./AnchoredPopover";
-import { MCPServersSettingsPage, SkillsSettingsPage } from "./CapabilitiesPanel";
-import { MemorySettingsPage } from "./MemoryPanel";
 import { getGenerativePreset, setGenerativePreset, generativeMusic, type GenerativePreset } from "../lib/generative-music";
 import { SoundSelect } from "./SoundSelect";
 import { getSuccessPreference, setSuccessPreference, getAttentionPreference, setAttentionPreference, playSuccessChime, playAttentionChime, type SoundWavPref } from "../lib/sound";
@@ -59,6 +56,11 @@ import { ShortcutComboDisplay } from "./ShortcutComboDisplay";
 
 const SETTINGS_TABS: SettingsTab[] = ["general", "models", "bots", "mcp", "skills", "memory", "hooks", "shortcuts", "permissions", "sandbox", "network", "appearance", "updates"];
 export type SettingsInitialFocus = { target: "bot-allowlist"; connectionId?: string };
+
+const MCPServersSettingsPage = lazy(() => import("./CapabilitiesPanel").then((module) => ({ default: module.MCPServersSettingsPage })));
+const SkillsSettingsPage = lazy(() => import("./CapabilitiesPanel").then((module) => ({ default: module.SkillsSettingsPage })));
+const MemorySettingsPage = lazy(() => import("./MemoryPanel").then((module) => ({ default: module.MemorySettingsPage })));
+const QRCodeSVG = lazy(() => import("qrcode.react").then((module) => ({ default: module.QRCodeSVG })));
 
 // SettingsPanel is the desktop settings centre — a centred modal with left
 // navigation and a right content area. It hosts all settings pages plus MCP,
@@ -71,7 +73,7 @@ export function SettingsPanel({
   agentRunning = false,
 }: {
   onClose: () => void;
-  onChanged: () => void;
+  onChanged: (settings?: SettingsView | null) => void;
   initialTab?: SettingsTab;
   initialFocus?: SettingsInitialFocus;
   agentRunning?: boolean;
@@ -92,11 +94,15 @@ export function SettingsPanel({
   // Play the modal exit animation, then let the parent unmount us.
   const { status, requestClose } = useDeferredClose(onClose, 240);
 
-  const reload = async () => setS(normalizeSettingsView(await app.Settings().catch(() => null)));
+  const reload = useCallback(async () => {
+    const next = normalizeSettingsView(await app.Settings().catch(() => null));
+    setS(next);
+    return next;
+  }, []);
   useEffect(() => {
     void reload();
     if (initialTab) setTab(initialTab === "providers" ? "models" : initialTab);
-  }, [initialTab]);
+  }, [initialTab, reload]);
   useEffect(() => {
     if (!s) return;
     const nextTheme = normalizeThemePreference(s.desktopTheme);
@@ -106,14 +112,14 @@ export function SettingsPanel({
   }, [s?.desktopTheme, s?.desktopThemeStyle]);
 
   // apply runs a mutation, re-reads settings, and refreshes the topbar/model.
-  const apply = async (fn: () => Promise<unknown>) => {
+  const apply = useCallback(async (fn: () => Promise<unknown>) => {
     setBusy(true);
     setErr(null);
     setWarning(null);
     try {
       const result = await fn();
-      await reload();
-      onChanged();
+      const next = await reload();
+      onChanged(next);
       if (typeof result === "string" && result.trim()) {
         setWarning(result.trim());
       }
@@ -122,18 +128,18 @@ export function SettingsPanel({
     } finally {
       setBusy(false);
     }
-  };
-  const backgroundApply = async (fn: () => Promise<void>) => {
+  }, [reload, onChanged]);
+  const backgroundApply = useCallback(async (fn: () => Promise<void>) => {
     setErr(null);
     setWarning(null);
     try {
       await fn();
-      await reload();
-      onChanged();
+      const next = await reload();
+      onChanged(next);
     } catch (e) {
       setErr(String((e as Error)?.message ?? e));
     }
-  };
+  }, [reload, onChanged]);
 
   // Close on Esc
   useEffect(() => {
@@ -148,6 +154,7 @@ export function SettingsPanel({
   // sandbox, appearance, updates) need SettingsView loaded. MCP, Skills, and Memory
   // load their own data and render regardless.
   const needsSettings = tab === "general" || tab === "models" || tab === "bots" || tab === "network" || tab === "permissions" || tab === "sandbox" || tab === "appearance" || tab === "updates";
+  const lazySettingsPageFallback = <div className="empty">{t("settings.loading")}</div>;
 
   return (
     <div className="management-modal-backdrop settings-modal-backdrop" data-state={status} onClick={(e) => { if (e.target === e.currentTarget) requestClose(); }}>
@@ -180,9 +187,9 @@ export function SettingsPanel({
                 {tab === "general" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><GeneralSection s={s} busy={busy} apply={apply} agentRunning={agentRunning} /></SettingsPageShell>}
                 {tab === "models" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><ModelsSection s={s} busy={busy} apply={apply} backgroundApply={backgroundApply} /></SettingsPageShell>}
                 {tab === "bots" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><BotsSection s={s} busy={busy} apply={apply} initialFocus={initialFocus} /></SettingsPageShell>}
-                {tab === "mcp" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><MCPServersSettingsPage /></SettingsPageShell>}
-                {tab === "skills" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><SkillsSettingsPage /></SettingsPageShell>}
-                {tab === "memory" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><MemorySettingsPage /></SettingsPageShell>}
+                {tab === "mcp" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><Suspense fallback={lazySettingsPageFallback}><MCPServersSettingsPage /></Suspense></SettingsPageShell>}
+                {tab === "skills" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><Suspense fallback={lazySettingsPageFallback}><SkillsSettingsPage /></Suspense></SettingsPageShell>}
+                {tab === "memory" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><Suspense fallback={lazySettingsPageFallback}><MemorySettingsPage /></Suspense></SettingsPageShell>}
                 {tab === "hooks" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><HooksSection onChanged={onChanged} /></SettingsPageShell>}
                 {tab === "shortcuts" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><ShortcutsSection /></SettingsPageShell>}
                 {tab === "permissions" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><PermissionsSection s={s} busy={busy} apply={apply} /></SettingsPageShell>}
@@ -527,8 +534,9 @@ function ShortcutsSection() {
               </div>
               <div className="shortcuts-settings__control">
                 <button
-                  className={`shortcuts-settings__key${isRecording ? " shortcuts-settings__key--recording" : ""}`}
+                  className={`shortcuts-settings__key${isRecording ? " shortcuts-settings__key--recording" : ""}${definition.configurable === false ? " shortcuts-settings__key--locked" : ""}`}
                   type="button"
+                  disabled={definition.configurable === false}
                   aria-label={isRecording ? t("settings.shortcutsRecording") : display}
                   aria-pressed={isRecording}
                   onClick={() => {
@@ -565,7 +573,7 @@ function ShortcutsSection() {
 function allRefs(s: SettingsView): string[] {
   const out: string[] = [];
   for (const p of s.providers) {
-    if (!p.added || !p.keySet) continue;
+    if (!p.added || !providerIsConfigured(p)) continue;
     for (const m of p.models) out.push(`${p.name}/${m}`);
   }
   return out;
@@ -750,6 +758,7 @@ function normalizeBotMappingScope(scope: unknown, workspaceRoot: unknown): "glob
 
 function normalizeProviderView(p: ProviderView): ProviderView {
   const visionModels = asArray(p.visionModels);
+  const requiresKey = providerRequiresKey(p);
   return {
     ...p,
     builtIn: Boolean(p.builtIn),
@@ -760,6 +769,8 @@ function normalizeProviderView(p: ProviderView): ProviderView {
     modelsUrl: p.modelsUrl ?? "",
     reasoningProtocol: normalizeReasoningProtocol(p.reasoningProtocol),
     supportedEfforts: asArray(p.supportedEfforts),
+    requiresKey,
+    configured: providerIsConfigured({ ...p, requiresKey }),
     keySource: p.keySource ?? "",
     keySourcePath: p.keySourcePath ?? "",
   };
@@ -775,8 +786,8 @@ function normalizeSettingsView(view: SettingsView | null | undefined): SettingsV
     noProxy: "",
     proxy: { type: "socks5", server: "", port: 0, username: "", password: "" },
   };
-  const agent = view.agent ?? { temperature: 0, maxSteps: 0, plannerMaxSteps: 12, systemPrompt: "", coldResumePrune: true, reasoningLanguage: "auto" };
-  agent.plannerMaxSteps = Number.isFinite(agent.plannerMaxSteps) ? Math.max(0, Math.trunc(agent.plannerMaxSteps)) : 12;
+  const agent = view.agent ?? { temperature: 0, maxSteps: 0, plannerMaxSteps: 0, systemPrompt: "", coldResumePrune: true, reasoningLanguage: "auto" };
+  agent.plannerMaxSteps = Number.isFinite(agent.plannerMaxSteps) ? Math.max(0, Math.trunc(agent.plannerMaxSteps)) : 0;
   agent.maxSteps = Number.isFinite(agent.maxSteps) ? Math.max(0, Math.trunc(agent.maxSteps)) : 0;
   agent.reasoningLanguage = normalizeReasoningLanguage(agent.reasoningLanguage);
   return {
@@ -827,10 +838,12 @@ function normalizeDisplayMode(mode: string | undefined): DisplayMode {
   return mode === "standard" || mode === "compact" ? mode : "standard";
 }
 
-type DesktopLayoutStyle = "classic" | "workbench";
+type DesktopLayoutStyle = "classic" | "workbench" | "creation";
 
 function normalizeDesktopLayoutStyle(style: string | undefined): DesktopLayoutStyle {
-  return style === "classic" ? "classic" : "workbench";
+  if (style === "classic") return "classic";
+  if (style === "creation") return "creation";
+  return "workbench";
 }
 
 function desktopLayoutStyleLabel(style: DesktopLayoutStyle, t: ReturnType<typeof useT>): string {
@@ -1100,7 +1113,7 @@ function GeneralSection({ s, busy, apply, agentRunning }: SectionProps & { agent
       </SettingsField>
       <SettingsField label={t("settings.desktopLayoutStyle")}>
         <div className="set-seg">
-          {(["classic", "workbench"] as const).map((style) => (
+          {(["classic", "workbench", "creation"] as const).map((style) => (
             <button
               key={style}
               className={`set-seg__btn${desktopLayoutStyle === style ? " set-seg__btn--on" : ""}`}
@@ -2718,7 +2731,9 @@ function BotsSection({ s, busy, apply, initialFocus }: BotsSectionProps) {
                   installQrIsImage ? (
                     <img src={installQrURL} alt={t("settings.botInstallQrAlt")} />
                   ) : (
-                    <QRCodeSVG className="bot-connect-panel__qr-code" value={installQrURL} size={196} marginSize={1} />
+                    <Suspense fallback={<div className="bot-connect-panel__state"><QrCode aria-hidden="true" /></div>}>
+                      <QRCodeSVG className="bot-connect-panel__qr-code" value={installQrURL} size={196} marginSize={1} />
+                    </Suspense>
                   )
                 ) : install.status === "starting" ? (
                   <div className="bot-connect-panel__state">
@@ -2953,7 +2968,7 @@ function ModelsSection({ s, busy, apply, backgroundApply }: ModelsSectionProps) 
   const t = useT();
   const [subtab, setSubtab] = useState<"usage" | "access">("usage");
   const autoRefreshKeyRef = useRef("");
-  const refs = allRefs(s);
+  const refs = useMemo(() => allRefs(s), [s.providers]);
   const defaultRef = toRef(s.defaultModel, s);
   const plannerRef = toRef(s.plannerModel, s);
   const subagentRef = toRef(s.subagentModel, s);
@@ -2962,10 +2977,10 @@ function ModelsSection({ s, busy, apply, backgroundApply }: ModelsSectionProps) 
   const defaultProviderView = s.providers.find((p) => p.name === defaultProvider);
   const modelIssue = !defaultProviderView
     ? t("settings.modelUnavailable", { ref: defaultRef || t("common.none") })
-    : !defaultProviderView.keySet
+    : !providerIsConfigured(defaultProviderView)
       ? t("settings.modelNeedsKey", { provider: modelProviderLabel(defaultProvider, defaultProviderView, t) })
       : "";
-  const agent = s.agent ?? { temperature: 0, maxSteps: 0, plannerMaxSteps: 12, systemPrompt: "", coldResumePrune: true, reasoningLanguage: "auto" };
+  const agent = s.agent ?? { temperature: 0, maxSteps: 0, plannerMaxSteps: 0, systemPrompt: "", coldResumePrune: true, reasoningLanguage: "auto" };
   const setAgentSteps = (maxSteps: number, plannerMaxSteps: number) => (
     app.SetAgentParams(agent.temperature, maxSteps, plannerMaxSteps, agent.systemPrompt)
   );
@@ -2975,11 +2990,11 @@ function ModelsSection({ s, busy, apply, backgroundApply }: ModelsSectionProps) 
     const groups = providerAccessGroups(s.providers.filter((p) => p.added), t);
     const candidates = groups
       .map((group) => {
-        const provider = group.providers.find((p) => p.keySet && p.apiKeyEnv && p.baseUrl);
+        const provider = group.providers.find((p) => providerIsConfigured(p) && p.baseUrl);
         return provider ? { group, provider } : null;
       })
       .filter((item): item is { group: ProviderAccessGroup; provider: ProviderView } => Boolean(item));
-    const refreshKey = candidates.map(({ group, provider }) => `${group.id}:${provider.apiKeyEnv}`).join("|");
+    const refreshKey = candidates.map(({ group, provider }) => `${group.id}:${provider.apiKeyEnv || provider.name}:${provider.baseUrl}`).join("|");
     if (!refreshKey || autoRefreshKeyRef.current === refreshKey) return;
     autoRefreshKeyRef.current = refreshKey;
 
@@ -3162,8 +3177,14 @@ function ModelPicker({
   const t = useT();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const q = query.trim().toLowerCase();
+  // Debounce search to avoid expensive filtering on every keystroke
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQuery(query), 150);
+    return () => clearTimeout(timer);
+  }, [query]);
+  const q = debouncedQuery.trim().toLowerCase();
   const emptyLabel = includeSameDefault ? t("settings.plannerNone") : emptyOptionLabel;
   const emptyHint = includeSameDefault ? t("settings.plannerNoneHint") : emptyOptionHint;
   const emptyMeta = includeSameDefault ? t("settings.plannerNoneHintShort") : emptyOptionHint;
@@ -3207,6 +3228,7 @@ function ModelPicker({
           groupID,
           label: firstProvider ? providerGroupLabel(firstProvider, t) : groupID,
           keySet: providerViews.some((p) => p.keySet),
+          requiresKey: providerViews.every((p) => providerRequiresKey(p)),
           options: uniqueModelOptions(options.filter((opt) => modelOptionGroupID(opt) === groupID)),
         };
       })
@@ -3275,7 +3297,7 @@ function ModelPicker({
             <div className="settings-model-picker__group" key={group.groupID}>
               <div className="settings-model-picker__group-title">
                 <span>{group.label}</span>
-                <small>{group.keySet ? t("settings.keySet") : t("settings.noKey")}</small>
+                <small>{providerKeyStatusLabel(group, t)}</small>
               </div>
               {group.options.map((opt) => (
                 <button
@@ -3315,8 +3337,13 @@ function modelOptionFromRef(ref: string, s: SettingsView): ModelPickerOption | n
 }
 
 function modelOptionMeta(option: ModelPickerOption, t: ReturnType<typeof useT>): string {
-  const key = option.providerView?.keySet ? t("settings.keySet") : t("settings.noKey");
+  const key = option.providerView ? providerKeyStatusLabel(option.providerView, t) : t("settings.noKey");
   return `${modelProviderLabel(option.provider, option.providerView, t)} · ${key}`;
+}
+
+function providerKeyStatusLabel(provider: { keySet: boolean; requiresKey?: boolean; apiKeyEnv?: string }, t: ReturnType<typeof useT>): string {
+  if (!providerRequiresKey(provider)) return t("settings.noKeyRequired");
+  return provider.keySet ? t("settings.keySet") : t("settings.noKey");
 }
 
 function modelProviderLabel(provider: string, providerView: ProviderView | undefined, t: ReturnType<typeof useT>): string {
@@ -3362,7 +3389,7 @@ function ProvidersSection({ s, busy, apply }: SectionProps) {
   const [fetchingProvider, setFetchingProvider] = useState<string | null>(null);
   const [fetchResults, setFetchResults] = useState<Record<string, ProviderFetchResult>>({});
   const [modelDrafts, setModelDrafts] = useState<Record<string, ProviderModelDraft>>({});
-  const groups = providerAccessGroups(s.providers.filter((p) => p.added), t);
+  const groups = useMemo(() => providerAccessGroups(s.providers.filter((p) => p.added), t), [s.providers, t]);
 
   const setGroupFetchResult = (groupID: string, result: ProviderFetchResult | null) => {
     setFetchResults((prev) => {
@@ -3619,6 +3646,8 @@ type ProviderAccessGroup = {
   providers: ProviderView[];
   apiKeyEnv: string;
   keySet: boolean;
+  requiresKey: boolean;
+  configured: boolean;
   keySource?: string;
   keySourcePath?: string;
   baseUrl: string;
@@ -3639,12 +3668,10 @@ type ProviderModelDraft = {
 };
 
 type AddProviderMode = null | "official" | "custom";
-type OfficialProviderKind = "deepseek" | "mimo-api" | "mimo-token-plan";
+type OfficialProviderKind = "deepseek";
 
 const OFFICIAL_PROVIDER_CHOICES: Array<{ kind: OfficialProviderKind; labelKey: DictKey; descKey: DictKey; keyEnv: string }> = [
   { kind: "deepseek", labelKey: "settings.addProvider.official.deepseek", descKey: "settings.addProvider.official.deepseekDesc", keyEnv: "DEEPSEEK_API_KEY" },
-  { kind: "mimo-api", labelKey: "settings.addProvider.official.mimoApi", descKey: "settings.addProvider.official.mimoApiDesc", keyEnv: "MIMO_API_KEY" },
-  { kind: "mimo-token-plan", labelKey: "settings.addProvider.official.mimoTokenPlan", descKey: "settings.addProvider.official.mimoTokenPlanDesc", keyEnv: "MIMO_API_KEY" },
 ];
 
 function AddProviderPanel({
@@ -3831,7 +3858,7 @@ function ProviderAccessCard({
               {group.builtIn ? t("settings.builtinProviderBadge") : t("settings.customProviderBadge")}
             </span>
             <span className={`badge ${group.keySet ? "badge--project" : "badge--feedback"}`}>
-              {group.keySet ? t("settings.keySet") : t("settings.noKey")}
+              {providerKeyStatusLabel(group, t)}
             </span>
           </div>
           <div className="provider-access-card__desc">{group.description}</div>
@@ -3849,7 +3876,7 @@ function ProviderAccessCard({
           )}
           <button
             className="btn btn--small"
-            disabled={busy || fetching || !group.baseUrl || !group.apiKeyEnv || !group.keySet}
+            disabled={busy || fetching || !group.baseUrl || !group.configured}
             onClick={onRefresh}
           >
             {fetching ? t("settings.fetchingModels") : t("settings.fetchModels")}
@@ -3881,8 +3908,8 @@ function ProviderAccessCard({
       </div>
 
       <div className="provider-card-block">
-        <div className="provider-card-block__label">{t(group.keySet ? "settings.enabledModels" : "settings.modelList")}</div>
-        <div className="provider-model-chips" aria-label={t(group.keySet ? "settings.enabledModels" : "settings.modelList")}>
+        <div className="provider-card-block__label">{t(group.configured ? "settings.enabledModels" : "settings.modelList")}</div>
+        <div className="provider-model-chips" aria-label={t(group.configured ? "settings.enabledModels" : "settings.modelList")}>
           {visibleModels.length > 0 ? visibleModels.map((model) => (
             <span className="provider-model-chip" key={model}>
               {model}
@@ -3894,7 +3921,7 @@ function ProviderAccessCard({
             </span>
           )}
         </div>
-        {!group.keySet && (
+        {!group.configured && group.requiresKey && (
           <div className="provider-card-status provider-card-status--warn">
             {t("settings.modelsRequireKey")}
           </div>
@@ -3980,9 +4007,15 @@ function ProviderModelDraftPicker({
 }) {
   const t = useT();
   const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  // Debounce search to avoid expensive filtering on every keystroke
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQuery(query), 150);
+    return () => clearTimeout(timer);
+  }, [query]);
   const selected = new Set(draft.selected);
   const vision = new Set(draft.visionModels);
-  const q = query.trim().toLowerCase();
+  const q = debouncedQuery.trim().toLowerCase();
   const visibleCandidates = q
     ? draft.candidates.filter((model) => model.toLowerCase().includes(q))
     : draft.candidates;
@@ -4061,6 +4094,8 @@ function providerAccessGroups(providers: ProviderView[], t: ReturnType<typeof us
     if (existing) {
       existing.providers.push(p);
       existing.keySet = existing.keySet || p.keySet;
+      existing.requiresKey = existing.requiresKey && providerRequiresKey(p);
+      existing.configured = existing.configured || providerIsConfigured(p);
       if (!existing.keySource && p.keySource) existing.keySource = p.keySource;
       if (!existing.keySourcePath && p.keySourcePath) existing.keySourcePath = p.keySourcePath;
       existing.models = uniqueStrings([...existing.models, ...p.models]);
@@ -4074,6 +4109,8 @@ function providerAccessGroups(providers: ProviderView[], t: ReturnType<typeof us
       providers: [p],
       apiKeyEnv: p.apiKeyEnv,
       keySet: p.keySet,
+      requiresKey: providerRequiresKey(p),
+      configured: providerIsConfigured(p),
       keySource: p.keySource,
       keySourcePath: p.keySourcePath,
       baseUrl: p.baseUrl,
@@ -4097,13 +4134,6 @@ function canonicalOfficialProviderName(name: string): string {
     case "deepseek-flash":
     case "deepseek-pro":
       return "deepseek";
-    case "mimo":
-    case "xiaomi-mimo":
-    case "xiaomi_mimo":
-      return "mimo-api";
-    case "mimo-pro":
-    case "mimo-flash":
-      return "mimo-token-plan";
     default:
       return name.trim();
   }
@@ -4114,8 +4144,6 @@ function officialProviderKind(p: ProviderView): string {
   const name = canonicalOfficialProviderName(p.name);
   const host = providerBaseHost(p.baseUrl);
   if (name === "deepseek" && host === "api.deepseek.com") return "deepseek";
-  if (name === "mimo-token-plan" && host === "token-plan-cn.xiaomimimo.com") return "mimo-token-plan";
-  if (name === "mimo-api" && host === "api.xiaomimimo.com") return "mimo-api";
   return "";
 }
 
@@ -4128,23 +4156,23 @@ function providerGroupID(p: ProviderView): string {
 function providerGroupLabel(p: ProviderView, t?: ReturnType<typeof useT>): string {
   const id = providerGroupID(p);
   if (id === "builtin:deepseek") return t ? t("settings.providerLabel.deepseek") : "DeepSeek";
-  if (id === "builtin:mimo-api") return t ? t("settings.providerLabel.mimoApi") : "Mimo API";
-  if (id === "builtin:mimo-token-plan") return t ? t("settings.providerLabel.mimoTokenPlan") : "Mimo Token Plan";
   return p.name;
 }
 
 function providerGroupDescription(p: ProviderView, t: ReturnType<typeof useT>): string {
   const id = providerGroupID(p);
   if (id === "builtin:deepseek") return t("settings.providerDesc.deepseek");
-  if (id === "builtin:mimo-api") return t("settings.providerDesc.mimoApi");
-  if (id === "builtin:mimo-token-plan") return t("settings.providerDesc.mimoTokenPlan");
   return p.baseUrl;
 }
 
 function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
   const out: string[] = [];
   for (const value of values) {
-    if (value && !out.includes(value)) out.push(value);
+    if (value && !seen.has(value)) {
+      seen.add(value);
+      out.push(value);
+    }
   }
   return out;
 }
@@ -4174,14 +4202,22 @@ function parseBotListInput(value: string): string[] {
     .filter(Boolean));
 }
 
-function apiKeyEnvFromProviderName(name: string): string {
-  const stem = name
-    .trim()
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "");
-  return stem ? `${stem}_API_KEY` : "CUSTOM_API_KEY";
-}
+// Memoized model chips for ProviderEditor — prevents re-render when typing
+// in name/key/baseUrl fields.
+const ModelChips = memo(function ModelChips({ modelNames }: { modelNames: string[] }) {
+  const t = useT();
+  if (modelNames.length === 0) return null;
+  return (
+    <div className="provider-model-chips">
+      {modelNames.slice(0, 8).map((model) => (
+        <span className="provider-model-chip" key={model}>{model}</span>
+      ))}
+      {modelNames.length > 8 && (
+        <span className="provider-model-chip provider-model-chip--more">{t("settings.moreModels", { n: modelNames.length - 8 })}</span>
+      )}
+    </div>
+  );
+});
 
 function ProviderEditor({
   initial,
@@ -4265,7 +4301,7 @@ function ProviderEditor({
     setFetchStatus(null);
     setFetchErr(null);
     try {
-      const effectiveApiKeyEnv = apiKeyEnv.trim() || apiKeyEnvFromProviderName(name);
+      const effectiveApiKeyEnv = providerApiKeyEnvForSave(name, apiKeyEnv, keyDraft);
       if (!apiKeyEnv.trim()) setApiKeyEnv(effectiveApiKeyEnv);
       if (keyDraft.trim()) await app.SetProviderKey(effectiveApiKeyEnv, keyDraft.trim());
       const fetched = await app.FetchProviderModels({
@@ -4307,7 +4343,7 @@ function ProviderEditor({
   const save = async () => {
     const ms = parseProviderListInput(models);
     const vms = parseProviderListInput(visionModels).filter((model) => ms.includes(model));
-    const effectiveApiKeyEnv = apiKeyEnv.trim() || apiKeyEnvFromProviderName(name);
+    const effectiveApiKeyEnv = providerApiKeyEnvForSave(name, apiKeyEnv, keyDraft);
     if (keyDraft.trim()) await app.SetProviderKey(effectiveApiKeyEnv, keyDraft.trim());
     onSave({
       name: name.trim(),
@@ -4366,11 +4402,11 @@ function ProviderEditor({
     );
   }
 
-  const modelNames = models
-    .split(",")
-    .map((m) => m.trim())
-    .filter(Boolean);
-  const canFetch = Boolean(name.trim() && baseUrl.trim() && (keyDraft.trim() || apiKeyEnv.trim()));
+  const modelNames = useMemo(
+    () => models.split(",").map((m) => m.trim()).filter(Boolean),
+    [models],
+  );
+  const canFetch = Boolean(name.trim() && baseUrl.trim());
 
   const protocolField = initial ? (
     <select className="mem-select" value={kind} onChange={(e) => setKind(e.target.value)}>
@@ -4556,14 +4592,7 @@ function ProviderEditor({
       {modelNames.length > 0 && (
         <div className="provider-card-block">
           <div className="provider-card-block__label">{t("settings.availableModels")}</div>
-          <div className="provider-model-chips">
-            {modelNames.slice(0, 8).map((model) => (
-              <span className="provider-model-chip" key={model}>{model}</span>
-            ))}
-            {modelNames.length > 8 && (
-              <span className="provider-model-chip provider-model-chip--more">{t("settings.moreModels", { n: modelNames.length - 8 })}</span>
-            )}
-          </div>
+          <ModelChips modelNames={modelNames} />
         </div>
       )}
       <label className="set-label">{t("settings.manualModels")}</label>
@@ -4744,7 +4773,7 @@ function ruleListHint(list: string, t: ReturnType<typeof useT>): string {
 
 type HookScope = "global" | "project";
 
-function HooksSection({ onChanged }: { onChanged: () => void }) {
+function HooksSection({ onChanged }: { onChanged: (settings?: SettingsView | null) => void }) {
   const t = useT();
   const [scope, setScope] = useState<HookScope>("global");
   const [view, setView] = useState<HooksSettingsView | null>(null);

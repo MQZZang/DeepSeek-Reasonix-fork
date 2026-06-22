@@ -340,7 +340,6 @@ export function Composer({
   onSetCollaborationMode,
   onSetToolApprovalMode,
   onToggleYoloApprovalMode,
-  onSetGoal,
   onClearGoal,
   onSwitchModel,
   onSetEffort,
@@ -374,7 +373,6 @@ export function Composer({
   onSetCollaborationMode: (mode: CollaborationMode) => void;
   onSetToolApprovalMode: (mode: ToolApprovalMode) => void;
   onToggleYoloApprovalMode: () => void;
-  onSetGoal: (goal: string) => void;
   onClearGoal: () => void;
   onSwitchModel: (name: string) => void;
   onSetEffort: (level: string) => void;
@@ -1575,7 +1573,6 @@ export function Composer({
     ? ({ height: `${textareaAutoHeight}px`, overflowY: textareaAutoOverflow ? "auto" : "hidden" } as CSSProperties)
     : undefined;
   const composerAutoExpanded = composerHeight === null && textareaAutoHeight !== null && textareaAutoHeight > 40;
-  const draftGoal = text.trim();
   void onSetMode;
   const chooseApprovalMode = (nextMode: ToolApprovalMode) => {
     onSetToolApprovalMode(nextMode);
@@ -1589,9 +1586,8 @@ export function Composer({
       return;
     }
     if (mode === "goal") {
-      if (draftGoal) {
-        onSetGoal(draftGoal);
-        setText("");
+      if (goalModeOn) {
+        onClearGoal();
         return;
       }
       onSetCollaborationMode("goal");
@@ -1907,7 +1903,7 @@ export function Composer({
         </div>
       )}
       <div
-        className={`composer-card${composerHeight !== null ? " composer-card--resized" : ""}${composerAutoExpanded ? " composer-card--autosized" : ""}${composerResizing ? " composer-card--resizing" : ""}`}
+        className={`composer-card${composerHeight !== null ? " composer-card--resized" : ""}${composerAutoExpanded ? " composer-card--autosized" : ""}${composerResizing ? " composer-card--resizing" : ""}${running ? " composer-card--running" : ""}`}
         ref={composerCardRef}
         style={composerCardStyle}
       >

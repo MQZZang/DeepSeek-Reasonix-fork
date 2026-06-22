@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,15 @@ import (
 	"reasonix/internal/hook"
 	"reasonix/internal/provider"
 )
+
+type captureTurnRunner struct {
+	inputs []string
+}
+
+func (r *captureTurnRunner) Run(_ context.Context, input string) error {
+	r.inputs = append(r.inputs, input)
+	return nil
+}
 
 func TestWithFreshSystemPromptReplacesExistingSystemMessage(t *testing.T) {
 	msgs := []provider.Message{
@@ -102,8 +112,60 @@ func TestProviderViewFromEntryShowsKeySource(t *testing.T) {
 	if !view.KeySet {
 		t.Fatal("KeySet = false, want true")
 	}
+	if !view.Configured {
+		t.Fatal("Configured = false, want true from resolved credentials")
+	}
 	if view.KeySource == "" || !strings.Contains(view.KeySource, "credentials") {
 		t.Fatalf("KeySource = %q, want credentials source", view.KeySource)
+	}
+}
+
+func TestProviderViewFromEntryExposesNoAuthAvailability(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	t.Setenv("LOCAL_API_KEY", "")
+	os.Unsetenv("LOCAL_API_KEY")
+
+	noAuth := providerViewFromEntry(config.ProviderEntry{
+		Name:    "local",
+		Kind:    "openai",
+		BaseURL: "http://127.0.0.1:23333/v1",
+		Models:  []string{"model-a"},
+	}, false, true)
+	if noAuth.RequiresKey {
+		t.Fatal("no-auth provider RequiresKey = true, want false")
+	}
+	if !noAuth.Configured {
+		t.Fatal("no-auth provider Configured = false, want true")
+	}
+	if noAuth.KeySet {
+		t.Fatal("no-auth provider KeySet = true, want false")
+	}
+
+	legacyLoopback := providerViewFromEntry(config.ProviderEntry{
+		Name:      "local",
+		Kind:      "openai",
+		BaseURL:   "http://127.0.0.1:23333/v1",
+		Models:    []string{"model-a"},
+		APIKeyEnv: "LOCAL_API_KEY",
+	}, false, true)
+	if legacyLoopback.RequiresKey {
+		t.Fatal("loopback provider with missing legacy key env RequiresKey = true, want false")
+	}
+	if !legacyLoopback.Configured {
+		t.Fatal("loopback provider with missing legacy key env Configured = false, want true")
+	}
+
+	official := providerViewFromEntry(config.ProviderEntry{
+		Name:    "deepseek",
+		Kind:    "openai",
+		BaseURL: "https://api.deepseek.com",
+		Models:  []string{"deepseek-v4-flash"},
+	}, true, true)
+	if !official.RequiresKey {
+		t.Fatal("official provider RequiresKey = false, want true")
+	}
+	if official.Configured {
+		t.Fatal("official provider without key Configured = true, want false")
 	}
 }
 
@@ -358,34 +420,9 @@ func TestSaveProviderPreservesExplicitEmptyVisionModels(t *testing.T) {
 	}
 }
 
-func TestOfficialMimoAPITemplateIncludesVisionModels(t *testing.T) {
-	entries, keyEnv, err := officialProviderTemplate("mimo-api", "en")
-	if err != nil {
-		t.Fatalf("officialProviderTemplate: %v", err)
-	}
-	if keyEnv != "MIMO_API_KEY" || len(entries) != 1 {
-		t.Fatalf("template = %v/%q, want one MIMO_API_KEY entry", entries, keyEnv)
-	}
-	got := entries[0]
-	for _, model := range []string{"mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-omni"} {
-		if !got.HasModel(model) {
-			t.Fatalf("mimo-api models = %v, missing %s", got.ModelList(), model)
-		}
-	}
-	if got.DefaultModel() != "mimo-v2.5-pro" {
-		t.Fatalf("mimo-api default = %q, want mimo-v2.5-pro", got.DefaultModel())
-	}
-	if got.Prices["mimo-v2.5-pro"] == nil || got.Prices["mimo-v2.5-pro"].Currency != "¥" || got.Prices["mimo-v2.5-pro"].Output != 6 {
-		t.Fatalf("mimo-v2.5-pro price = %+v, want RMB domestic pricing", got.Prices["mimo-v2.5-pro"])
-	}
-	if got.Prices["mimo-v2.5"] == nil || got.Prices["mimo-v2.5"].Currency != "¥" || got.Prices["mimo-v2.5"].Output != 2 {
-		t.Fatalf("mimo-v2.5 price = %+v, want RMB domestic pricing", got.Prices["mimo-v2.5"])
-	}
-	if got.Prices["mimo-v2-omni"] == nil || got.Prices["mimo-v2-omni"].Currency != "¥" || got.Prices["mimo-v2-omni"].Output != 2 {
-		t.Fatalf("mimo-v2-omni price = %+v, want RMB domestic pricing", got.Prices["mimo-v2-omni"])
-	}
-	if want := []string{"mimo-v2.5", "mimo-v2-omni"}; !reflect.DeepEqual(got.VisionModels, want) {
-		t.Fatalf("mimo-api vision_models = %v, want %v", got.VisionModels, want)
+func TestOfficialMimoAPITemplateRemoved(t *testing.T) {
+	if entries, keyEnv, err := officialProviderTemplate("mimo-api", "en"); err == nil {
+		t.Fatalf("officialProviderTemplate(mimo-api) = entries=%v key=%q nil error, want unknown template", entries, keyEnv)
 	}
 }
 
@@ -490,6 +527,155 @@ func TestSetReasoningLanguageUpdatesLiveTabControllers(t *testing.T) {
 	projectComposed := projectCtrl.Compose("hi")
 	if !strings.Contains(projectComposed, "use English") {
 		t.Fatalf("project override tab Compose = %q, want en reasoning language", projectComposed)
+	}
+}
+
+func TestSetAutoPlanUpdatesLiveTabControllers(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	app := NewApp()
+	userRunner := &captureTurnRunner{}
+	projectRunner := &captureTurnRunner{}
+	userCtrl := control.New(control.Options{AutoPlan: "on", Runner: userRunner})
+	projectCtrl := control.New(control.Options{AutoPlan: "on", Runner: projectRunner})
+	app.tabs = map[string]*WorkspaceTab{
+		"user": {
+			ID:          "user",
+			Scope:       "global",
+			Ctrl:        userCtrl,
+			Ready:       true,
+			disabledMCP: map[string]ServerView{},
+		},
+		"project": {
+			ID:            "project",
+			Scope:         "project",
+			WorkspaceRoot: t.TempDir(),
+			Ctrl:          projectCtrl,
+			Ready:         true,
+			disabledMCP:   map[string]ServerView{},
+		},
+	}
+	app.activeTabID = "user"
+
+	if err := app.SetAutoPlan("off"); err != nil {
+		t.Fatalf("SetAutoPlan: %v", err)
+	}
+
+	input := "实现 GitHub issue #2395：\n- 新增配置项\n- 自动判断复杂任务\n- 补测试和文档"
+	if err := userCtrl.RunTurn(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	if err := projectCtrl.RunTurn(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	if len(userRunner.inputs) != 1 || strings.HasPrefix(userRunner.inputs[0], control.PlanModeMarker) {
+		t.Fatalf("user tab should use updated auto_plan=off, inputs=%q", userRunner.inputs)
+	}
+	if len(projectRunner.inputs) != 1 || strings.HasPrefix(projectRunner.inputs[0], control.PlanModeMarker) {
+		t.Fatalf("project tab without override should use updated auto_plan=off, inputs=%q", projectRunner.inputs)
+	}
+}
+
+func TestSetAutoPlanIgnoresProjectOverrideForLiveTab(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	projectRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(projectRoot, "reasonix.toml"), []byte("[agent]\nauto_plan = \"on\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app := NewApp()
+	userRunner := &captureTurnRunner{}
+	projectRunner := &captureTurnRunner{}
+	userCtrl := control.New(control.Options{AutoPlan: "on", Runner: userRunner})
+	projectCtrl := control.New(control.Options{AutoPlan: "on", Runner: projectRunner})
+	app.tabs = map[string]*WorkspaceTab{
+		"user": {
+			ID:          "user",
+			Scope:       "global",
+			Ctrl:        userCtrl,
+			Ready:       true,
+			disabledMCP: map[string]ServerView{},
+		},
+		"project": {
+			ID:            "project",
+			Scope:         "project",
+			WorkspaceRoot: projectRoot,
+			Ctrl:          projectCtrl,
+			Ready:         true,
+			disabledMCP:   map[string]ServerView{},
+		},
+	}
+	app.activeTabID = "user"
+
+	if err := app.SetAutoPlan("off"); err != nil {
+		t.Fatalf("SetAutoPlan: %v", err)
+	}
+
+	input := "实现 GitHub issue #2395：\n- 新增配置项\n- 自动判断复杂任务\n- 补测试和文档"
+	if err := userCtrl.RunTurn(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	if err := projectCtrl.RunTurn(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+	if len(userRunner.inputs) != 1 || strings.HasPrefix(userRunner.inputs[0], control.PlanModeMarker) {
+		t.Fatalf("user tab should use updated auto_plan=off, inputs=%q", userRunner.inputs)
+	}
+	if len(projectRunner.inputs) != 1 || strings.HasPrefix(projectRunner.inputs[0], control.PlanModeMarker) {
+		t.Fatalf("project auto_plan should be ignored, inputs=%q", projectRunner.inputs)
+	}
+}
+
+func TestSetAutoPlanEnablingClassifierRebuildsActiveController(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	cfg.Agent.AutoPlan = "off"
+	cfg.Agent.AutoPlanClassifier = "deepseek-flash"
+	if err := cfg.SaveTo(config.UserConfigPath()); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	app := NewApp()
+	app.ctx = context.Background()
+	app.readyHook = func() {}
+	old := control.New(control.Options{AutoPlan: "off", Label: "old-controller"})
+	app.setTestCtrl(old, "deepseek-flash/deepseek-v4-flash")
+	defer func() {
+		if c := app.activeCtrl(); c != nil {
+			c.Close()
+		}
+	}()
+
+	if err := app.SetAutoPlan("on"); err != nil {
+		t.Fatalf("SetAutoPlan(on): %v", err)
+	}
+	if c := app.activeCtrl(); c == nil {
+		t.Fatal("SetAutoPlan should leave a rebuilt controller")
+	}
+	if c := app.activeCtrl(); c == old {
+		t.Fatal("SetAutoPlan should rebuild when enabling a configured classifier")
+	}
+
+	got := config.LoadForEdit(config.UserConfigPath())
+	if got.Agent.AutoPlan != "on" {
+		t.Fatalf("saved auto_plan = %q, want on", got.Agent.AutoPlan)
+	}
+}
+
+func TestSetReasoningLanguageRejectsBackgroundJobsBeforeSavingConfig(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	app := NewApp()
+	app.setTestCtrl(newBackgroundJobController(t, "reasoning-language-job"), "")
+
+	err := app.SetReasoningLanguage("zh")
+	if err == nil || !strings.Contains(err.Error(), "stop background jobs") {
+		t.Fatalf("SetReasoningLanguage with background job error = %v, want active-work guard", err)
+	}
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	if cfg.ReasoningLanguage() != "auto" {
+		t.Fatalf("reasoning language changed after rejected update: %q", cfg.ReasoningLanguage())
 	}
 }
 

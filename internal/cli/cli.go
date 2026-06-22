@@ -156,6 +156,14 @@ func migrateLegacyConfigForCLI() {
 	}
 }
 
+func migrateMCPConfigForCLIWorkspace() {
+	if wd, err := os.Getwd(); err == nil {
+		if _, err := config.MigrateMCPToUserConfigOnUpgrade([]string{wd}); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: MCP config migration failed:", err)
+		}
+	}
+}
+
 func configureCLIThemeFromConfig() {
 	if cfg, err := config.Load(); err == nil {
 		configureCLIThemeWithStyle(cfg.UITheme(), cfg.UIThemeStyle())
@@ -185,6 +193,7 @@ func configureCLIThemeFromConfigNoProbe() {
 // the agent's typed event stream — runAgent passes a TextSink that renders to
 // stdout, the TUI passes an event-channel sink so events become tea.Msgs.
 func setup(ctx context.Context, modelName string, maxStepsOverride int, requireKey bool, sink event.Sink) (*control.Controller, error) {
+	migrateMCPConfigForCLIWorkspace()
 	return boot.Build(ctx, boot.Options{
 		Model:      modelName,
 		MaxSteps:   maxStepsOverride,
@@ -252,6 +261,13 @@ func modelForResumePath(modelName, resumePath string, cfg *config.Config) string
 	return sessionModel
 }
 
+func loadResumableSession(path string) (*agent.Session, error) {
+	if agent.IsCleanupPending(path) {
+		return nil, fmt.Errorf("session is pending cleanup")
+	}
+	return agent.LoadSession(path)
+}
+
 var newNotificationSender = func() notify.Sender { return notify.NewPlatformSender() }
 
 // withNotifications adds system notifications to CLI event streams when configured.
@@ -288,6 +304,16 @@ func runAgent(args []string) int {
 	if prompt == "" {
 		fmt.Fprintln(os.Stderr, i18n.M.UsageRunHint)
 		return 2
+	}
+
+	var resumeSession *agent.Session
+	if *resume != "" {
+		var err error
+		resumeSession, err = loadResumableSession(*resume)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
@@ -332,12 +358,7 @@ func runAgent(args []string) int {
 	// precedence over --continue.
 	// --continue: resume the most recent saved session.
 	if *resume != "" {
-		loaded, err := agent.LoadSession(*resume)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
-			return 1
-		}
-		ctrl.Resume(loaded, *resume)
+		ctrl.Resume(resumeSession, *resume)
 	} else if *cont {
 		sessions, err := agent.ListSessions(ctrl.SessionDir())
 		if err != nil || len(sessions) == 0 {
@@ -388,6 +409,15 @@ func runServe(args []string) int {
 	ctx := context.Background()
 	bc := serve.NewBroadcaster()
 	cfg, _ := config.Load()
+	var resumeSession *agent.Session
+	if *resume != "" {
+		var err error
+		resumeSession, err = loadResumableSession(*resume)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+	}
 	*model = modelForResumePath(*model, *resume, cfg)
 	ctrl, err := setup(ctx, *model, *maxSteps, true, bc)
 	if err != nil {
@@ -398,12 +428,7 @@ func runServe(args []string) int {
 
 	// Auto-save target: reuse the resumed file, else a fresh one — same as chat.
 	if *resume != "" {
-		loaded, err := agent.LoadSession(*resume)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
-			return 1
-		}
-		ctrl.Resume(loaded, *resume)
+		ctrl.Resume(resumeSession, *resume)
 	} else if ctrl.SessionDir() != "" {
 		ctrl.SetSessionPath(agent.NewSessionPath(ctrl.SessionDir(), ctrl.Label()))
 	}
@@ -871,7 +896,7 @@ func selectLanguage() (string, error) {
 }
 
 // selectEnabledProviders prompts a single multi-select of provider families
-// (DeepSeek / MiMo / custom / …) and returns one ProviderEntry per chosen
+// (DeepSeek / custom / …) and returns one ProviderEntry per chosen
 // family, carrying the models the user picked. Built-in families try the
 // OpenAI-compatible GET /models endpoint first (so the user sees the real
 // list, not a stale hard-coded one) and fall back to the preset's static
@@ -1180,8 +1205,7 @@ func providerSlug(kind, baseURL string) string {
 
 // providerFamily is a wizard-only grouping of provider SKUs by vendor; it does
 // not exist in config because users editing reasonix.toml deal with SKU names
-// directly. Keys mirror the SKU name prefix (deepseek-*, mimo) so adding a new
-// preset only requires a familyOf case.
+// directly.
 type providerFamily struct {
 	key  string
 	name string
@@ -1192,8 +1216,6 @@ func familyOf(name string) providerFamily {
 	switch {
 	case strings.HasPrefix(name, "deepseek"):
 		return providerFamily{key: "deepseek", name: "DeepSeek", desc: "fast & cheap, plus a stronger Pro SKU"}
-	case strings.HasPrefix(name, "mimo"):
-		return providerFamily{key: "mimo", name: "MiMo (Xiaomi)", desc: "long-horizon agentic"}
 	default:
 		return providerFamily{key: name, name: name}
 	}
@@ -1426,26 +1448,26 @@ func groupByFamily(providers []config.ProviderEntry) ([]string, map[string][]int
 	return order, members, info
 }
 
-// withBuiltinFamilies guarantees the wizard always offers the built-in provider
-// families (DeepSeek, MiMo) even when the loaded config replaced them — a
-// reasonix.toml that defines only [[providers]] for deepseek otherwise hides
-// MiMo from setup, since [[providers]] replaces the presets wholesale. Families
-// already present are left untouched (the user's customizations win); only the
-// missing built-in families get their default entries appended.
+// withBuiltinFamilies guarantees the wizard always offers the built-in DeepSeek
+// family even when the loaded config replaced the defaults.
+// Built-in entries whose exact name already exists in the user's config are
+// kept as-is (preserving customizations); missing built-in entries within an
+// existing family are appended so the model picker always shows the full
+// catalogue rather than only the previously selected subset.
 func withBuiltinFamilies(providers []config.ProviderEntry) []config.ProviderEntry {
 	return withBuiltinFamiliesForLanguage(providers, "")
 }
 
 func withBuiltinFamiliesForLanguage(providers []config.ProviderEntry, pricingLanguage string) []config.ProviderEntry {
-	have := map[string]bool{}
+	haveName := map[string]bool{}
 	for _, p := range providers {
-		have[familyOf(p.Name).key] = true
+		haveName[p.Name] = true
 	}
 	defaults := config.Default()
 	defaults.Language = pricingLanguage
 	defaults.ApplyDeepSeekOfficialDefaultPricing()
 	for _, bp := range defaults.Providers {
-		if k := familyOf(bp.Name).key; !have[k] {
+		if !haveName[bp.Name] {
 			providers = append(providers, bp)
 		}
 	}
@@ -1454,10 +1476,9 @@ func withBuiltinFamiliesForLanguage(providers []config.ProviderEntry, pricingLan
 
 // providersWithMissingKeys returns the providers the active configuration
 // actually references (default/planner/subagent models) whose api_key_env is
-// declared but not set. Merely-available presets stay silent — a DeepSeek-only
-// user must not be prompted for MIMO_API_KEY (#3939); the chat banner still
-// warns if they later switch to a model whose key is missing. configureKeys
-// dedupes shared envs, so duplicates are fine to leave in.
+// declared but not set. Merely-available providers stay silent; the chat banner
+// still warns if users later switch to a model whose key is missing.
+// configureKeys dedupes shared envs, so duplicates are fine to leave in.
 func providersWithMissingKeys(cfg *config.Config) []config.ProviderEntry {
 	if cfg == nil {
 		return nil
@@ -1650,8 +1671,12 @@ func configCommand(args []string) int {
 
 func configAutoPlanCommand(args []string) int {
 	fs := flag.NewFlagSet("config auto-plan", flag.ContinueOnError)
-	local := fs.Bool("local", false, "write ./reasonix.toml instead of the user config")
+	local := fs.Bool("local", false, "unsupported; auto-plan is user-level only")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *local {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "auto-plan is user-level only; --local is not supported")
 		return 2
 	}
 	rest := fs.Args()
@@ -1671,31 +1696,9 @@ func configAutoPlanCommand(args []string) int {
 		return 0
 	}
 	path := config.UserConfigPath()
-	if *local {
-		path = "reasonix.toml"
-	}
 	if path == "" {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "cannot resolve config path")
 		return 1
-	}
-	if *local {
-		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-			probe := config.Default()
-			if err := probe.SetAutoPlan(rest[0]); err != nil {
-				fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
-				return 2
-			}
-			mode, err := config.SaveMinimalProjectAutoPlan(path, rest[0])
-			if err != nil {
-				fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
-				return 1
-			}
-			fmt.Printf("auto_plan = %q (%s)\n", mode, displayPath(path))
-			return 0
-		} else if err != nil {
-			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
-			return 1
-		}
 	}
 	cfg := config.LoadForEdit(path)
 	if err := cfg.SetAutoPlan(rest[0]); err != nil {
@@ -1772,14 +1775,14 @@ func configReasoningLanguageCommand(args []string) int {
 
 func configUsage() {
 	fmt.Print(`Usage:
-  reasonix config auto-plan [--local] [off|on]
+  reasonix config auto-plan [off|on]
   reasonix config reasoning-language [--local] [auto|zh|en]
 `)
 }
 
 func configAutoPlanUsage() {
 	fmt.Print(`Usage:
-  reasonix config auto-plan [--local] [off|on]
+  reasonix config auto-plan [off|on]
 `)
 }
 

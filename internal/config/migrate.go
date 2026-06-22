@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/BurntSushi/toml"
 )
 
 // legacyConfig is the subset of the v0.x (~/.reasonix/config.json) schema this
@@ -53,6 +56,14 @@ type MigrationResult struct {
 	KeyToEnv bool
 	Plugins  int
 	Warnings []string
+}
+
+// MCPGlobalMigrationResult summarizes the v1.9.1 MCP backfill that lifts MCP
+// servers from legacy and project-local sources into the user-global config.
+type MCPGlobalMigrationResult struct {
+	To      string
+	Added   int
+	Sources int
 }
 
 func (r *MigrationResult) Notice() string {
@@ -152,6 +163,171 @@ func MigrateLegacyIfNeeded() (*MigrationResult, error) {
 	return res, credErr
 }
 
+// MigrateMCPToUserConfigOnUpgrade runs a one-time best-effort backfill for the
+// v1.9.1 desktop/CLI upgrade: MCP servers found in legacy TOML, known project
+// roots, and legacy v0.x JSON are copied into the user-global config so the MCP
+// settings page is stable across Global/project tabs. Existing global entries win
+// on name collisions, and source files are left untouched.
+func MigrateMCPToUserConfigOnUpgrade(projectRoots []string) (*MCPGlobalMigrationResult, error) {
+	marker := mcpGlobalMigrationMarkerPath()
+	if marker == "" {
+		return nil, nil
+	}
+	if _, err := os.Stat(marker); err == nil {
+		return nil, nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	res, err := migrateMCPToUserConfig(projectRoots)
+	if err != nil {
+		return res, err
+	}
+	if res == nil {
+		return nil, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		return res, err
+	}
+	if err := os.WriteFile(marker, []byte("v1\n"), 0o644); err != nil {
+		return res, err
+	}
+	return res, nil
+}
+
+func migrateMCPToUserConfig(projectRoots []string) (*MCPGlobalMigrationResult, error) {
+	dest := userConfigPath()
+	if dest == "" {
+		return nil, nil
+	}
+	userCfg, err := loadForEditStrict(dest, true)
+	if err != nil {
+		return nil, err
+	}
+	have := make(map[string]bool, len(userCfg.Plugins))
+	for _, p := range userCfg.Plugins {
+		if name := strings.TrimSpace(p.Name); name != "" {
+			have[name] = true
+		}
+	}
+
+	result := &MCPGlobalMigrationResult{To: dest}
+	addEntries := func(entries []PluginEntry) {
+		if len(entries) == 0 {
+			return
+		}
+		result.Sources++
+		for _, entry := range entries {
+			entry, _ = NormalizePluginCommandLine(entry)
+			name := strings.TrimSpace(entry.Name)
+			if name == "" || have[name] || validatePlugin(entry) != nil {
+				continue
+			}
+			userCfg.Plugins = append(userCfg.Plugins, entry)
+			have[name] = true
+			result.Added++
+		}
+	}
+
+	home, _ := os.UserHomeDir()
+	for _, path := range mcpMigrationLegacyTOMLPaths(dest, home) {
+		addEntries(loadPluginEntriesFromTOML(path))
+	}
+	for _, root := range normalizedMCPMigrationRoots(projectRoots) {
+		addEntries(loadPluginEntriesFromTOML(filepath.Join(root, "reasonix.toml")))
+		if entries, err := loadMCPJSON(filepath.Join(root, mcpJSONFile)); err == nil {
+			addEntries(entries)
+		}
+	}
+	addEntries(loadLegacyConfigPlugins(legacyConfigPath()))
+
+	if result.Sources == 0 {
+		return nil, nil
+	}
+	if result.Added > 0 {
+		if err := userCfg.SaveTo(dest); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
+}
+
+func mcpGlobalMigrationMarkerPath() string {
+	dir := userSupportDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "mcp-global-migration-v1")
+}
+
+func mcpMigrationLegacyTOMLPaths(dest, home string) []string {
+	var paths []string
+	for _, path := range legacyTOMLPaths(dest, home) {
+		if path == "" || samePath(path, dest) {
+			continue
+		}
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+func loadPluginEntriesFromTOML(path string) []PluginEntry {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	var cfg Config
+	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+		return nil
+	}
+	out := make([]PluginEntry, 0, len(cfg.Plugins))
+	for _, p := range cfg.Plugins {
+		p, _ = NormalizePluginCommandLine(p)
+		out = append(out, p)
+	}
+	return out
+}
+
+func loadLegacyConfigPlugins(path string) []PluginEntry {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var legacy legacyConfig
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return nil
+	}
+	return legacyPlugins(legacy)
+}
+
+func normalizedMCPMigrationRoots(roots []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(roots))
+	for _, root := range roots {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(root); err == nil {
+			root = abs
+		}
+		root = filepath.Clean(root)
+		if seen[root] {
+			continue
+		}
+		seen[root] = true
+		out = append(out, root)
+	}
+	return out
+}
+
 func migrateLegacyCredentialsIfNeeded() error {
 	missing := map[string]string{}
 	for _, src := range legacyCredentialsPaths() {
@@ -248,7 +424,15 @@ func migrateLegacyTOMLIfNeeded(dest, home string) (*MigrationResult, error) {
 		if err := cfg.WriteFile(dest); err != nil {
 			return nil, fmt.Errorf("write %s: %w", dest, err)
 		}
-		return &MigrationResult{From: src, To: dest, Plugins: len(cfg.Plugins)}, nil
+		res := &MigrationResult{From: src, To: dest, Plugins: len(cfg.Plugins)}
+		legacyDir := filepath.Dir(src)
+		newDir := filepath.Dir(dest)
+		if !samePath(legacyDir, newDir) {
+			if warnings := migrateSupportData(legacyDir, newDir); len(warnings) > 0 {
+				res.Warnings = append(res.Warnings, warnings...)
+			}
+		}
+		return res, nil
 	}
 	return nil, nil
 }
@@ -393,6 +577,113 @@ func writeCredentialsEnv(home string, lines []string) error {
 			return os.WriteFile(filepath.Join(home, ".env"), []byte(strings.Join(lines, "\n")+"\n"), 0o600)
 		}
 		return err
+	}
+	return nil
+}
+
+func migrateSupportData(legacyDir, newDir string) []string {
+	var warnings []string
+	items := []string{"sessions", "projects", "skills", "archive", "hooks.json"}
+	for _, item := range items {
+		src := filepath.Join(legacyDir, item)
+		fi, err := os.Stat(src)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			warnings = append(warnings, fmt.Sprintf("failed to read legacy item %s: %v", item, err))
+			continue
+		}
+		dst := filepath.Join(newDir, item)
+		if fi.IsDir() {
+			if err := copyDir(src, dst); err != nil {
+				warnings = append(warnings, fmt.Sprintf("failed to migrate directory %s: %v", item, err))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("successfully migrated directory %s", item))
+			}
+		} else {
+			if err := copyFile(src, dst); err != nil {
+				warnings = append(warnings, fmt.Sprintf("failed to migrate file %s: %v", item, err))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("successfully migrated file %s", item))
+			}
+		}
+	}
+	return warnings
+}
+
+func copyFile(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	parentMode := os.FileMode(0o755)
+	if info.Mode().Perm()&0o077 == 0 {
+		parentMode = 0o700
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), parentMode); err != nil {
+		return err
+	}
+
+	perm := info.Mode().Perm()
+	if perm == 0 {
+		perm = 0o600
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	return os.Chmod(dst, perm)
+}
+
+func copyDir(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+
+	perm := info.Mode().Perm()
+	if perm == 0 {
+		perm = 0o700
+	}
+	if err := os.MkdirAll(dst, perm); err != nil {
+		return err
+	}
+	if err := os.Chmod(dst, perm); err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+
+		if entry.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+		} else {
+			if err := copyFile(srcPath, dstPath); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

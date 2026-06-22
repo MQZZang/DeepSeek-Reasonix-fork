@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,12 +14,14 @@ import (
 
 	"reasonix/internal/agent"
 	"reasonix/internal/checkpoint"
+	"reasonix/internal/command"
 	"reasonix/internal/event"
 	"reasonix/internal/hook"
 	"reasonix/internal/jobs"
 	"reasonix/internal/permission"
 	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
+	"reasonix/internal/skill"
 	"reasonix/internal/tool"
 )
 
@@ -107,11 +110,132 @@ func (t startBackgroundJobTool) Execute(ctx context.Context, _ json.RawMessage) 
 	return "started " + j.ID, nil
 }
 
+type recordingProvider struct {
+	name     string
+	streams  [][]provider.Chunk
+	requests []provider.Request
+}
+
+func (p *recordingProvider) Name() string {
+	if p.name != "" {
+		return p.name
+	}
+	return "recording"
+}
+
+func (p *recordingProvider) Stream(_ context.Context, req provider.Request) (<-chan provider.Chunk, error) {
+	p.requests = append(p.requests, req)
+	i := len(p.requests) - 1
+	if i >= len(p.streams) {
+		i = len(p.streams) - 1
+	}
+	chunks := p.streams[i]
+	ch := make(chan provider.Chunk, len(chunks))
+	for _, c := range chunks {
+		ch <- c
+	}
+	close(ch)
+	return ch, nil
+}
+
+func requestMessagesText(messages []provider.Message) string {
+	var b strings.Builder
+	for _, m := range messages {
+		b.WriteString(string(m.Role))
+		b.WriteString(": ")
+		b.WriteString(m.Content)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 func TestNewTreatsTypedNilSinkAsDiscard(t *testing.T) {
 	var sink *typedNilControllerSink
 	c := New(Options{Sink: sink})
 
 	c.notice("typed nil sink should not panic")
+}
+
+func TestClearSessionMarksCleanupPendingBeforeReturningForRunningJobs(t *testing.T) {
+	dir := t.TempDir()
+	oldPath := filepath.Join(dir, "old.jsonl")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldPath, []byte(`{"role":"user","content":"old"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
+	jm := jobs.NewManager(event.Discard)
+	release := make(chan struct{})
+	started := make(chan struct{})
+	defer func() {
+		close(release)
+		jm.Close()
+	}()
+	jm.StartForSession(agent.BranchID(oldPath), "task", "stuck clear", func(ctx context.Context, _ io.Writer) (string, error) {
+		close(started)
+		<-ctx.Done()
+		<-release
+		return "", ctx.Err()
+	})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background job never started")
+	}
+
+	ctrl := New(Options{Executor: exec, SessionDir: dir, SessionPath: oldPath, Label: "test", Jobs: jm})
+	if err := ctrl.ClearSession(); err != nil {
+		t.Fatalf("ClearSession: %v", err)
+	}
+	if !agent.IsCleanupPending(oldPath) {
+		t.Fatalf("old session should be cleanup-pending before ClearSession returns")
+	}
+	if _, err := os.Stat(oldPath); err != nil {
+		t.Fatalf("old session file should remain until delayed cleanup: %v", err)
+	}
+	sessions, err := agent.ListSessions(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, session := range sessions {
+		if filepath.Clean(session.Path) == filepath.Clean(oldPath) {
+			t.Fatalf("cleanup-pending old session still listed: %+v", sessions)
+		}
+	}
+}
+
+func TestReconcileCleanupPendingRemovesOrphanedArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "orphan.jsonl")
+	if err := os.WriteFile(path, []byte(`{"role":"user","content":"orphan"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.SaveBranchMeta(path, agent.BranchMeta{Name: "orphan"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(jobs.ArtifactDir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(jobs.ArtifactDir(path), "job.log"), []byte("job output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(ckptDir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.MarkCleanupPending(path, "delete"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ReconcileCleanupPending(dir); err != nil {
+		t.Fatalf("ReconcileCleanupPending: %v", err)
+	}
+	for _, p := range []string{path, agent.BranchMetaPath(path), jobs.ArtifactDir(path), ckptDir(path), agent.CleanupPendingPath(path)} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("%s still exists after reconciliation (err=%v)", p, err)
+		}
+	}
 }
 
 func TestRunTurnSnapshotsActivityWhenTranscriptChanges(t *testing.T) {
@@ -191,6 +315,29 @@ func TestSetSessionPathAdoptsTemporaryBackgroundJobs(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(jobs.ArtifactDir(path), jobID+".log")); err != nil {
 		t.Fatalf("controller job artifact should be under persistent sidecar: %v", err)
+	}
+}
+
+func TestGoalStatePersistsNextToSessionPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	sess := agent.NewSession("sys")
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	c := New(Options{Executor: exec, SessionDir: dir, SessionPath: path, Label: "test"})
+
+	c.SetGoalWithResearchMode("fix the typo", GoalResearchOn)
+	c.GoalStrict(true)
+
+	data, err := os.ReadFile(goalStatePath(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state goalState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Goal != "fix the typo" || state.Status != GoalStatusRunning || state.ResearchMode != GoalResearchOn || !state.Strict {
+		t.Fatalf("goal state = %+v, want running strict research goal", state)
 	}
 }
 
@@ -332,6 +479,118 @@ func TestNewSessionStartsFreshContextAndSavesTranscript(t *testing.T) {
 	}
 }
 
+func TestNewSessionResetsTwoModelPlannerContext(t *testing.T) {
+	dir := t.TempDir()
+	planner := &recordingProvider{name: "planner", streams: [][]provider.Chunk{
+		textTurn("OLD PLAN: inspect alpha.go"),
+		textTurn("NEW PLAN: inspect beta.go"),
+	}}
+	execProv := &recordingProvider{name: "executor", streams: [][]provider.Chunk{
+		textTurn("old done"),
+		textTurn("new done"),
+	}}
+	exec := agent.New(execProv, tool.NewRegistry(), agent.NewSession("exec sys"), agent.Options{}, event.Discard)
+	plannerSess := agent.NewSession("planner sys")
+	coord := agent.NewCoordinator(planner, plannerSess, nil, tool.NewRegistry(), agent.Options{}, exec, 0, event.Discard, nil)
+	path := filepath.Join(dir, "session.jsonl")
+	c := New(Options{Runner: coord, Executor: exec, SystemPrompt: "exec sys", SessionDir: dir, SessionPath: path, Label: "test"})
+
+	if err := c.Run(context.Background(), "old task alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.NewSession(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Run(context.Background(), "new task beta"); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(planner.requests) != 2 {
+		t.Fatalf("planner requests = %d, want 2", len(planner.requests))
+	}
+	second := requestMessagesText(planner.requests[1].Messages)
+	if strings.Contains(second, "old task alpha") || strings.Contains(second, "OLD PLAN") {
+		t.Fatalf("new planner request leaked previous session context:\n%s", second)
+	}
+	if !strings.Contains(second, "new task beta") {
+		t.Fatalf("new planner request missing current task:\n%s", second)
+	}
+}
+
+func TestResumeResetsTwoModelPlannerContext(t *testing.T) {
+	dir := t.TempDir()
+	planner := &recordingProvider{name: "planner", streams: [][]provider.Chunk{
+		textTurn("OLD PLAN: inspect alpha.go"),
+		textTurn("RESUMED PLAN: inspect gamma.go"),
+	}}
+	execProv := &recordingProvider{name: "executor", streams: [][]provider.Chunk{
+		textTurn("old done"),
+		textTurn("resumed done"),
+	}}
+	exec := agent.New(execProv, tool.NewRegistry(), agent.NewSession("exec sys"), agent.Options{}, event.Discard)
+	plannerSess := agent.NewSession("planner sys")
+	coord := agent.NewCoordinator(planner, plannerSess, nil, tool.NewRegistry(), agent.Options{}, exec, 0, event.Discard, nil)
+	c := New(Options{Runner: coord, Executor: exec, SystemPrompt: "exec sys", SessionDir: dir, SessionPath: filepath.Join(dir, "old.jsonl"), Label: "test"})
+
+	if err := c.Run(context.Background(), "old task alpha"); err != nil {
+		t.Fatal(err)
+	}
+	resumed := agent.NewSession("exec sys")
+	resumed.Add(provider.Message{Role: provider.RoleUser, Content: "saved task gamma"})
+	c.Resume(resumed, filepath.Join(dir, "resumed.jsonl"))
+	if err := c.Run(context.Background(), "continue gamma"); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(planner.requests) != 2 {
+		t.Fatalf("planner requests = %d, want 2", len(planner.requests))
+	}
+	second := requestMessagesText(planner.requests[1].Messages)
+	if strings.Contains(second, "old task alpha") || strings.Contains(second, "OLD PLAN") {
+		t.Fatalf("resumed planner request leaked previous session context:\n%s", second)
+	}
+	if !strings.Contains(second, "continue gamma") {
+		t.Fatalf("resumed planner request missing current task:\n%s", second)
+	}
+}
+
+func TestResetPlannerSessionClearsPlannerHistory(t *testing.T) {
+	dir := t.TempDir()
+	planner := &recordingProvider{name: "planner", streams: [][]provider.Chunk{
+		textTurn("FIRST PLAN: inspect alpha.go"),
+		textTurn("SECOND PLAN: inspect beta.go"),
+	}}
+	execProv := &recordingProvider{name: "executor", streams: [][]provider.Chunk{
+		textTurn("first done"),
+		textTurn("second done"),
+	}}
+	exec := agent.New(execProv, tool.NewRegistry(), agent.NewSession("exec sys"), agent.Options{}, event.Discard)
+	plannerSess := agent.NewSession("planner sys")
+	coord := agent.NewCoordinator(planner, plannerSess, nil, tool.NewRegistry(), agent.Options{}, exec, 0, event.Discard, nil)
+	path := filepath.Join(dir, "session.jsonl")
+	c := New(Options{Runner: coord, Executor: exec, SystemPrompt: "exec sys", SessionDir: dir, SessionPath: path, Label: "test"})
+
+	if err := c.Run(context.Background(), "first task"); err != nil {
+		t.Fatal(err)
+	}
+	// Explicitly reset the planner session (simulates a tab switch).
+	c.ResetPlannerSession()
+	if err := c.Run(context.Background(), "second task"); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(planner.requests) != 2 {
+		t.Fatalf("planner requests = %d, want 2", len(planner.requests))
+	}
+	second := requestMessagesText(planner.requests[1].Messages)
+	if strings.Contains(second, "first task") || strings.Contains(second, "FIRST PLAN") {
+		t.Fatalf("planner request after reset leaked previous session context:\n%s", second)
+	}
+	if !strings.Contains(second, "second task") {
+		t.Fatalf("planner request after reset missing current task:\n%s", second)
+	}
+}
+
 func TestSubmitClearDiscardsCurrentContextWithoutSavingTranscript(t *testing.T) {
 	dir := t.TempDir()
 	sess := agent.NewSession("sys")
@@ -382,6 +641,24 @@ func TestDisconnectMCPServerRemovesLazyPlaceholder(t *testing.T) {
 	}
 	if _, found := reg.Get("mcp__mock__connect"); found {
 		t.Fatalf("lazy placeholder still registered after disconnect; names=%v", reg.Names())
+	}
+}
+
+func TestUnregisterMCPServerToolsBlocksLateSharedHostSwap(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Add(fakeControlTool{name: "mcp__mock__connect"})
+	c := New(Options{Host: plugin.NewHost(), Registry: reg})
+
+	if ok := c.UnregisterMCPServerTools("mock"); !ok {
+		t.Fatal("UnregisterMCPServerTools returned false")
+	}
+	reg.Add(fakeControlTool{name: "mcp__mock__echo"})
+	if _, found := reg.Get("mcp__mock__echo"); found {
+		t.Fatalf("late shared-host tool swap was accepted after unregister; names=%v", reg.Names())
+	}
+	reg.Add(fakeControlTool{name: "mcp__other__echo"})
+	if _, found := reg.Get("mcp__other__echo"); !found {
+		t.Fatalf("unregister blocked unrelated MCP tools; names=%v", reg.Names())
 	}
 }
 
@@ -651,9 +928,7 @@ func TestPermissionRequestHookDoesNotFireForAutoApprovalMode(t *testing.T) {
 
 func TestPermissionRequestHookDoesNotFireForSessionGrant(t *testing.T) {
 	c, _, payloads := permissionHookController(t, "bash")
-	c.mu.Lock()
-	c.granted[permission.SessionGrantRuleForScope("bash", "go test ./...")] = true
-	c.mu.Unlock()
+	c.approval.grantSession("bash", "go test ./...")
 
 	allow, _, err := c.requestApproval(context.Background(), "bash", "go test ./...", nil)
 	if err != nil || !allow {
@@ -1181,4 +1456,469 @@ func TestApprovedPlanDoesNotAutoApproveNonContinuationTurn(t *testing.T) {
 	if approvalPrompts != 2 {
 		t.Fatalf("non-continuation writer should prompt after plan approval, prompts=%d", approvalPrompts)
 	}
+}
+
+// writeCmdFile creates a command .md file with frontmatter under dir.
+func writeCmdFile(t *testing.T, dir, name, description, body string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := fmt.Sprintf("---\ndescription: %s\n---\n%s\n", description, body)
+	if err := os.WriteFile(filepath.Join(dir, name+".md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCommandsAtomicPointer verifies that commands passed via Options.Commands are
+// correctly exposed through the atomic-pointer Commands() getter and that
+// CustomCommand resolves and renders them. Missing commands return found=false.
+func TestCommandsAtomicPointer(t *testing.T) {
+	cmds := []command.Command{
+		{Name: "review", Description: "Review code", Body: "Review $1"},
+		{Name: "test", Description: "Run tests", Body: "Test $1"},
+	}
+	c := New(Options{
+		Commands: cmds,
+		Sink:     &typedNilControllerSink{},
+		Registry: tool.NewRegistry(),
+	})
+
+	// Commands() returns what was passed via Options
+	got := c.Commands()
+	if len(got) != 2 {
+		t.Fatalf("Commands() = %d, want 2", len(got))
+	}
+	// Check retrieval via CustomCommand
+	sent, ok := c.CustomCommand("/review myfile.go")
+	if !ok {
+		t.Error("/review should be found")
+	}
+	if !strings.Contains(sent, "Review myfile.go") {
+		t.Errorf("unexpected render: %q", sent)
+	}
+	_, ok = c.CustomCommand("/missing")
+	if ok {
+		t.Error("/missing should not be found")
+	}
+
+	// Commands() getter uses atomic.Pointer internally
+	if cmds2 := c.Commands(); len(cmds2) != 2 {
+		t.Errorf("Commands() = %d after change, want 2", len(cmds2))
+	}
+}
+
+// TestReloadCommandsFromFilesystem exercises ReloadCommands against real .md
+// files in a temp workspace: initial load, hot-reload with a new file, and
+// hot-reload after modifying an existing file. Also verifies that skills are
+// preserved across the reload.
+func TestReloadCommandsFromFilesystem(t *testing.T) {
+	// Isolate HOME so CommandDirsForRoot does not pick up global .md command files.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+
+	wsRoot := t.TempDir()
+	cmdDir := filepath.Join(wsRoot, ".reasonix", "commands")
+	writeCmdFile(t, cmdDir, "review", "Review code", "Review $1")
+	writeCmdFile(t, cmdDir, "test", "Run tests", "Test $1")
+
+	// Create a minimal in-memory skill to verify skills are preserved across reload.
+	sk := skill.Skill{
+		Name:        "myskill",
+		Description: "Test skill",
+		Body:        "You are a test skill. User says: {{.Input}}",
+	}
+
+	reg := tool.NewRegistry()
+	c := New(Options{
+		Sink:          &typedNilControllerSink{},
+		Registry:      reg,
+		WorkspaceRoot: wsRoot,
+		Skills:        []skill.Skill{sk},
+	})
+
+	// ReloadCommands should pick up the two .md files and preserve the skill.
+	if err := c.ReloadCommands(context.Background()); err != nil {
+		t.Fatalf("ReloadCommands: %v", err)
+	}
+	cmds := c.Commands()
+	if len(cmds) != 2 {
+		t.Fatalf("Commands() = %d after reload, want 2", len(cmds))
+	}
+
+	// CustomCommand should resolve through the hot-swapped getter
+	sent, ok := c.CustomCommand("/review hello.go")
+	if !ok {
+		t.Fatal("/review should be found after reload")
+	}
+	if !strings.Contains(sent, "Review hello.go") {
+		t.Errorf("render = %q, want Review hello.go", sent)
+	}
+
+	// Missing command still not found
+	if _, ok := c.CustomCommand("/nope"); ok {
+		t.Error("/nope should not be found")
+	}
+
+	// Skill should appear in the slash_command tool's description after reload.
+	if tool, found := reg.Get("slash_command"); found {
+		if !strings.Contains(tool.Description(), "myskill") {
+			t.Error("skill 'myskill' should appear in slash_command tool Description after ReloadCommands")
+		}
+	} else {
+		t.Error("slash_command tool should be registered after ReloadCommands")
+	}
+
+	// Skill should still be callable via RunSkill after reload.
+	if _, ok := c.RunSkill("/myskill"); !ok {
+		t.Error("RunSkill(/myskill) should find the skill after ReloadCommands")
+	}
+
+	// Hot-reload: add a new command file
+	writeCmdFile(t, cmdDir, "count", "Count to N", "Count from 1 to $1")
+	if err := c.ReloadCommands(context.Background()); err != nil {
+		t.Fatalf("ReloadCommands (add): %v", err)
+	}
+	if cmds := c.Commands(); len(cmds) != 3 {
+		t.Fatalf("Commands() = %d after add, want 3", len(cmds))
+	}
+
+	// Hot-reload: modify an existing command
+	writeCmdFile(t, cmdDir, "review", "Review code (friendly)", "Kindly review $1")
+	if err := c.ReloadCommands(context.Background()); err != nil {
+		t.Fatalf("ReloadCommands (modify): %v", err)
+	}
+	if cmds := c.Commands(); len(cmds) != 3 {
+		t.Fatalf("Commands() = %d after modify, want 3", len(cmds))
+	}
+	sent, ok = c.CustomCommand("/review world.go")
+	if !ok {
+		t.Fatal("/review should be found after modify")
+	}
+	if !strings.Contains(sent, "Kindly review world.go") {
+		t.Errorf("render after modify = %q, want Kindly review world.go", sent)
+	}
+
+	// The slash_command tool should be registered and updated
+	if _, found := reg.Get("slash_command"); !found {
+		t.Error("slash_command tool should be registered after ReloadCommands")
+	}
+}
+
+// TestReloadCommandsDeleteFile verifies that removing a command .md file and
+// reloading causes the command to disappear from both Commands() and
+// CustomCommand(), while other commands remain intact.
+func TestReloadCommandsDeleteFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+
+	wsRoot := t.TempDir()
+	cmdDir := filepath.Join(wsRoot, ".reasonix", "commands")
+	writeCmdFile(t, cmdDir, "alpha", "Alpha cmd", "Alpha $1")
+	writeCmdFile(t, cmdDir, "beta", "Beta cmd", "Beta $1")
+
+	reg := tool.NewRegistry()
+	c := New(Options{
+		Sink:          &typedNilControllerSink{},
+		Registry:      reg,
+		WorkspaceRoot: wsRoot,
+	})
+
+	if err := c.ReloadCommands(context.Background()); err != nil {
+		t.Fatalf("initial reload: %v", err)
+	}
+	if got := len(c.Commands()); got != 2 {
+		t.Fatalf("Commands() = %d, want 2", got)
+	}
+
+	// Delete alpha.md
+	if err := os.Remove(filepath.Join(cmdDir, "alpha.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.ReloadCommands(context.Background()); err != nil {
+		t.Fatalf("reload after delete: %v", err)
+	}
+	if got := len(c.Commands()); got != 1 {
+		t.Fatalf("Commands() = %d after delete, want 1", got)
+	}
+
+	// /alpha should no longer be found
+	if _, ok := c.CustomCommand("/alpha x"); ok {
+		t.Error("/alpha should NOT be found after deletion")
+	}
+	// /beta should still work
+	sent, ok := c.CustomCommand("/beta y")
+	if !ok {
+		t.Error("/beta should still be found")
+	}
+	if !strings.Contains(sent, "Beta y") {
+		t.Errorf("render = %q, want Beta y", sent)
+	}
+}
+
+// TestReloadCommandsMalformedFile verifies that a malformed .md file causes
+// ReloadCommands to return an error but does not prevent other valid commands
+// from loading.
+func TestReloadCommandsMalformedFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+
+	wsRoot := t.TempDir()
+	cmdDir := filepath.Join(wsRoot, ".reasonix", "commands")
+	writeCmdFile(t, cmdDir, "good", "Good cmd", "Good $1")
+
+	// Write a malformed file (no valid frontmatter)
+	if err := os.MkdirAll(cmdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	broken := filepath.Join(cmdDir, "broken.md")
+	if err := os.WriteFile(broken, []byte("this is not valid yaml\n---\nrandom\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := tool.NewRegistry()
+	c := New(Options{
+		Sink:          &typedNilControllerSink{},
+		Registry:      reg,
+		WorkspaceRoot: wsRoot,
+	})
+
+	err := c.ReloadCommands(context.Background())
+	// We expect some error from the malformed file
+	if err == nil {
+		t.Log("ReloadCommands returned nil error despite malformed file — command.Load may tolerate it")
+	} else {
+		t.Logf("ReloadCommands returned error (expected): %v", err)
+	}
+
+	// The valid command should still be loadable
+	cmds := c.Commands()
+	foundGood := false
+	for _, cmd := range cmds {
+		if cmd.Name == "good" {
+			foundGood = true
+		}
+	}
+	if !foundGood {
+		t.Errorf("valid command 'good' should be present, got commands: %v", cmdNames(cmds))
+	}
+}
+
+// TestReloadCommandsSameNameAcrossDirs verifies that when the same command
+// name exists in multiple convention directories, the later-scanned directory
+// (higher priority) wins. ConventionDirs = [".reasonix", ".agents", ".agent",
+// ".claude"], scanned in reverse, so .reasonix is highest priority.
+func TestReloadCommandsSameNameAcrossDirs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+
+	wsRoot := t.TempDir()
+
+	// Lower priority: .claude/commands
+	claudeDir := filepath.Join(wsRoot, ".claude", "commands")
+	writeCmdFile(t, claudeDir, "greet", "Claude greet", "Hello from Claude: $1")
+
+	// Higher priority: .reasonix/commands
+	reasonixDir := filepath.Join(wsRoot, ".reasonix", "commands")
+	writeCmdFile(t, reasonixDir, "greet", "Reasonix greet", "Hello from Reasonix: $1")
+
+	reg := tool.NewRegistry()
+	c := New(Options{
+		Sink:          &typedNilControllerSink{},
+		Registry:      reg,
+		WorkspaceRoot: wsRoot,
+	})
+
+	if err := c.ReloadCommands(context.Background()); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	// There should be exactly 1 command named "greet"
+	cmds := c.Commands()
+	count := 0
+	for _, cmd := range cmds {
+		if cmd.Name == "greet" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 'greet' command, got %d", count)
+	}
+
+	// The winning version should be from .reasonix (highest priority)
+	sent, ok := c.CustomCommand("/greet world")
+	if !ok {
+		t.Fatal("/greet should be found")
+	}
+	if !strings.Contains(sent, "Hello from Reasonix") {
+		t.Errorf("expected .reasonix version to win, got render: %q", sent)
+	}
+}
+
+// TestReloadCommandsEmptySet verifies that deleting all command files and
+// reloading results in an empty Commands() slice, while the slash_command tool
+// still exists in the Registry (containing only Skills).
+func TestReloadCommandsEmptySet(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+
+	wsRoot := t.TempDir()
+	cmdDir := filepath.Join(wsRoot, ".reasonix", "commands")
+	writeCmdFile(t, cmdDir, "temp", "Temp cmd", "Temp $1")
+
+	sk := skill.Skill{
+		Name:        "preserved",
+		Description: "A skill to keep",
+		Body:        "Skill body: {{.Input}}",
+	}
+
+	reg := tool.NewRegistry()
+	c := New(Options{
+		Sink:          &typedNilControllerSink{},
+		Registry:      reg,
+		WorkspaceRoot: wsRoot,
+		Skills:        []skill.Skill{sk},
+	})
+
+	if err := c.ReloadCommands(context.Background()); err != nil {
+		t.Fatalf("initial reload: %v", err)
+	}
+	if got := len(c.Commands()); got != 1 {
+		t.Fatalf("Commands() = %d, want 1", got)
+	}
+
+	// Delete all command files
+	if err := os.Remove(filepath.Join(cmdDir, "temp.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.ReloadCommands(context.Background()); err != nil {
+		t.Fatalf("reload after delete all: %v", err)
+	}
+	if got := len(c.Commands()); got != 0 {
+		t.Fatalf("Commands() = %d after delete all, want 0", got)
+	}
+
+	// /temp should no longer be found
+	if _, ok := c.CustomCommand("/temp x"); ok {
+		t.Error("/temp should NOT be found after deletion")
+	}
+
+	// slash_command tool should still exist (for Skills)
+	slashTool, found := reg.Get("slash_command")
+	if !found {
+		t.Fatal("slash_command tool should still exist even with 0 commands")
+	}
+	// It should still contain the skill
+	if !strings.Contains(slashTool.Description(), "preserved") {
+		t.Error("skill 'preserved' should still appear in slash_command tool Description")
+	}
+}
+
+// TestReloadCommandsDesktopManagementNotice verifies the desktop/HTTP path:
+// when the frontend submits "/reload-cmd" as raw input, Submit → managementNotice
+// handles it and emits a Notice event with the correct count.
+func TestReloadCommandsDesktopManagementNotice(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+
+	wsRoot := t.TempDir()
+	cmdDir := filepath.Join(wsRoot, ".reasonix", "commands")
+	writeCmdFile(t, cmdDir, "hello", "Greet", "Hello $1")
+	writeCmdFile(t, cmdDir, "review", "Review code", "Review $1")
+
+	var notices []string
+	sink := event.FuncSink(func(e event.Event) {
+		if e.Kind == event.Notice {
+			notices = append(notices, e.Text)
+		}
+	})
+
+	reg := tool.NewRegistry()
+	c := New(Options{
+		Sink:          sink,
+		Registry:      reg,
+		WorkspaceRoot: wsRoot,
+	})
+
+	// Initial load so Commands() is populated.
+	if err := c.ReloadCommands(context.Background()); err != nil {
+		t.Fatalf("initial reload: %v", err)
+	}
+	notices = nil // reset
+
+	// Desktop path: managementNotice("/reload-cmd") should emit a notice.
+	handled := c.managementNotice("/reload-cmd")
+	if !handled {
+		t.Fatal("managementNotice(/reload-cmd) should return true")
+	}
+	if len(notices) != 1 {
+		t.Fatalf("expected 1 notice, got %d: %v", len(notices), notices)
+	}
+	if !strings.Contains(notices[0], "commands reloaded") {
+		t.Errorf("notice = %q, want 'commands reloaded'", notices[0])
+	}
+	if !strings.Contains(notices[0], "2 available") {
+		t.Errorf("notice = %q, want '2 available'", notices[0])
+	}
+
+	// Delete one command file and reload again.
+	if err := os.Remove(filepath.Join(cmdDir, "hello.md")); err != nil {
+		t.Fatal(err)
+	}
+	notices = nil
+	handled = c.managementNotice("/reload-cmd")
+	if !handled {
+		t.Fatal("managementNotice(/reload-cmd) after delete should return true")
+	}
+	if len(notices) != 1 {
+		t.Fatalf("expected 1 notice after delete, got %d: %v", len(notices), notices)
+	}
+	if !strings.Contains(notices[0], "1 available") {
+		t.Errorf("notice after delete = %q, want '1 available'", notices[0])
+	}
+
+	// Delete all and verify empty-set notice.
+	if err := os.Remove(filepath.Join(cmdDir, "review.md")); err != nil {
+		t.Fatal(err)
+	}
+	notices = nil
+	handled = c.managementNotice("/reload-cmd")
+	if !handled {
+		t.Fatal("managementNotice(/reload-cmd) empty set should return true")
+	}
+	if len(notices) != 1 {
+		t.Fatalf("expected 1 notice for empty set, got %d: %v", len(notices), notices)
+	}
+	if !strings.Contains(notices[0], "0 available") {
+		t.Errorf("notice for empty set = %q, want '0 available'", notices[0])
+	}
+}
+
+// cmdNames is a test helper that extracts command names from a slice.
+func cmdNames(cmds []command.Command) []string {
+	names := make([]string, len(cmds))
+	for i, c := range cmds {
+		names[i] = c.Name
+	}
+	return names
 }

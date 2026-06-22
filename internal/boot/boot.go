@@ -41,6 +41,7 @@ import (
 	"reasonix/internal/skill"
 	"reasonix/internal/tool"
 	"reasonix/internal/tool/builtin"
+	"reasonix/internal/tool/sessiontool"
 )
 
 // ErrUnknownModel is returned by Build when the configured model can't be
@@ -101,6 +102,20 @@ type Options struct {
 	// SessionDir overrides where persisted chat transcripts are written. When
 	// empty, the shared CLI/global session directory is used.
 	SessionDir string
+	// SharedHost is an optional plugin.Host shared across controllers for the
+	// same workspace root. When set, boot.Build reuses its running clients
+	// instead of creating new subprocesses, and the caller manages the host's
+	// lifecycle. When nil, Build creates and owns a new host as before.
+	SharedHost *plugin.Host
+	// CleanupPendingReconciler retries delayed physical cleanup for session
+	// artifacts left by a previous process. Nil uses the core physical-delete
+	// reconciler; frontends with different deletion semantics can override it.
+	CleanupPendingReconciler func(sessionDir string) error
+	// ApprovalTimeout bounds how long a tool-approval or ask prompt blocks for a
+	// user decision. Zero (default) waits forever — correct for an interactive
+	// terminal. Headless/bot frontends pass a positive value so an unanswered
+	// prompt can't wedge the session indefinitely (#4626, #4402).
+	ApprovalTimeout time.Duration
 }
 
 // Build loads config, resolves the model(s), and returns a Controller wrapping a
@@ -125,6 +140,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if modelName == "" {
 		modelName = cfg.DefaultModel
 	}
+	config.NormalizeLegacyMimoCustomProvidersForRefs(cfg, modelName)
 	tokenMode := NormalizeTokenMode(opts.TokenMode)
 	tokenEconomy := tokenMode == TokenModeEconomy
 	keepPolicy := agentKeepPolicy(cfg.Agent.Keep)
@@ -162,13 +178,20 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// A resolvable model whose API key env is unset would otherwise build fine
 	// (RequireKey is false so the UI stays reachable) and then fail silently on the
 	// first request, showing as an empty/dead model. Surface the cause up front.
-	if !opts.RequireKey && entry.APIKeyEnv != "" && entry.APIKey() == "" {
+	if !opts.RequireKey && entry.RequiresAPIKey() && entry.APIKey() == "" {
 		sink.Emit(event.Event{Kind: event.Notice, Text: fmt.Sprintf("model %q is selected but its API key %s is not set — requests will fail until you set it", modelName, entry.APIKeyEnv)})
 	}
 	jm := jobs.NewManager(sink, jobs.WithStalledWarningAfter(time.Duration(cfg.BackgroundJobStalledWarningSeconds())*time.Second))
 	sessionDir := opts.SessionDir
 	if sessionDir == "" {
 		sessionDir = config.SessionDir()
+	}
+	reconcileCleanupPending := opts.CleanupPendingReconciler
+	if reconcileCleanupPending == nil {
+		reconcileCleanupPending = control.ReconcileCleanupPending
+	}
+	if err := reconcileCleanupPending(sessionDir); err != nil {
+		sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "cleanup-pending reconciliation failed: " + err.Error()})
 	}
 
 	proxySpec := cfg.NetworkProxySpec()
@@ -245,15 +268,18 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		enabledBuiltins = tokenEconomyBuiltins(enabledBuiltins)
 	}
 	addBuiltins(reg, enabledBuiltins, cfg.WriteRootsForRoot(root), bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec)
-	// Always construct a host, even with no plugins configured, so the controller's
-	// host pointer is stable for the session and `/mcp add` can hot-add into it.
-	pluginHost := plugin.NewHost()
+	// Use the caller-supplied shared host when set, so controllers for the same
+	// workspace root reuse running MCP processes (e.g. one CodeGraph daemon
+	// instead of one per tab). Otherwise construct a private host per controller.
+	pluginHost := opts.SharedHost
+	if pluginHost == nil {
+		pluginHost = plugin.NewHost()
+	}
 
-	// Partition configured plugins by tier so eager/lazy/background can each
-	// take the path that fits them. User entries default to background: the
-	// session starts immediately while enabled MCP servers warm up.
+	// Partition configured plugins by tier so eager can block when explicitly
+	// requested while every other enabled MCP warms up in the background.
 	autoStartEntries := cfg.AutoStartPlugins()
-	eagerEntries, lazyEntries, bgEntries := partitionByTier(autoStartEntries)
+	eagerEntries, bgEntries := partitionByTier(autoStartEntries)
 	extraSpecs := applyKnownPluginOverrides(opts.ExtraPlugins, root)
 	onDemandMCPSpecs := map[string]plugin.Spec{}
 	onDemandMCPNames := []string{}
@@ -268,11 +294,11 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			}
 			onDemandMCPSpecs[name] = spec
 		}
-		eagerEntries, lazyEntries, bgEntries = nil, nil, nil
+		eagerEntries, bgEntries = nil, nil
 	}
 
 	// Auto-demote: any eager plugin that has been chronically slow (recent
-	// samples repeatedly hit the blocking startup budget) drops to lazy
+	// samples repeatedly hit the blocking startup budget) drops to background
 	// for this session. The user keeps eager intent, just doesn't pay for it
 	// on a server that's been misbehaving. A notice surfaces the demotion.
 	var demoteMessages []string
@@ -282,7 +308,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		rec := plugin.Recommend(e.Name, budget, 0)
 		if rec.Demote {
 			demoteMessages = append(demoteMessages, rec.Reason)
-			lazyEntries = append(lazyEntries, e)
+			bgEntries = append(bgEntries, e)
 			continue
 		}
 		kept = append(kept, e)
@@ -290,7 +316,6 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	eagerEntries = kept
 
 	eagerSpecs := PluginSpecsForRoot(eagerEntries, root)
-	lazySpecs := PluginSpecsForRoot(lazyEntries, root)
 	bgSpecs := PluginSpecsForRoot(bgEntries, root)
 
 	if !tokenEconomy {
@@ -302,9 +327,6 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		for i := range eagerSpecs {
 			eagerSpecs[i].Stderr = opts.Stderr
 		}
-		for i := range lazySpecs {
-			lazySpecs[i].Stderr = opts.Stderr
-		}
 		for i := range bgSpecs {
 			bgSpecs[i].Stderr = opts.Stderr
 		}
@@ -312,40 +334,105 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 
 	// Eager: block until handshake. Failures show up in /mcp.
 	if len(eagerSpecs) > 0 {
-		host, ptools := plugin.StartAvailable(ctx, eagerSpecs)
-		pluginHost = host
-		for _, t := range ptools {
-			reg.Add(t)
-		}
-		// PhaseB (prompts + resources) runs on the boot ctx — which is the
-		// controller's session-scoped PluginCtx — so the auxiliary surfaces
-		// keep streaming in after Start returns without holding up the agent.
-		go host.StartPhaseB(ctx, sink)
-		if text, ok := MCPStartupNotice(host.Failures()); ok {
-			sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: text})
-		}
-	}
-
-	// Lazy / background: register placeholder tools now; the real spawn waits
-	// for either the first model call (lazy) or a goroutine kicked off here
-	// (background). Both share the same pluginHost so /mcp status, hot-add,
-	// and Close see one cohesive set of servers regardless of tier.
-	registerDeferred := func(specs []plugin.Spec, kick bool) {
-		for _, s := range specs {
-			cs, _ := plugin.LoadCachedSchema(s.Name, plugin.SpecFingerprint(s))
-			for _, t := range plugin.LazyToolset(s, cs, pluginHost, reg, ctx, kick) {
+		// When using a shared host, reuse already-connected clients and
+		// add new ones directly to the host instead of creating a separate one.
+		if opts.SharedHost != nil {
+			for _, s := range eagerSpecs {
+				if pluginHost.HasClient(s.Name) {
+					tools, err := pluginHost.ToolsFor(ctx, s.Name)
+					if err == nil {
+						for _, t := range tools {
+							reg.Add(t)
+						}
+						continue
+					}
+				}
+				// Use a bounded per-plugin timeout matching StartAvailable's
+				// defaultStartTimeout (5s) so a hanging MCP server doesn't
+				// block the tab boot indefinitely.
+				addCtx, addCancel := context.WithTimeout(ctx, 5*time.Second)
+				tools, err := pluginHost.Add(addCtx, s)
+				addCancel()
+				if err != nil {
+					if plugin.IsServerAlreadyConnected(err) || errors.Is(err, plugin.ErrSpawningInFlight) {
+						// Race: another tab connected the same server between
+						// HasClient and Add, or is currently spawning it.
+						// Fetch tools from the existing client, or wait briefly.
+						tools, err2 := pluginHost.ToolsFor(ctx, s.Name)
+						if err2 == nil {
+							for _, t := range tools {
+								reg.Add(t)
+							}
+							continue
+						}
+					}
+					sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
+						Text: fmt.Sprintf("mcp %s: %v", s.Name, err)})
+					continue
+				}
+				for _, t := range tools {
+					reg.Add(t)
+				}
+			}
+		} else {
+			host, ptools := plugin.StartAvailable(ctx, eagerSpecs)
+			pluginHost = host
+			for _, t := range ptools {
 				reg.Add(t)
+			}
+			// PhaseB (prompts + resources) runs on the boot ctx — which is the
+			// controller's session-scoped PluginCtx — so the auxiliary surfaces
+			// keep streaming in after Start returns without holding up the agent.
+			go host.StartPhaseB(ctx, sink)
+			if text, ok := MCPStartupNotice(host.Failures()); ok {
+				sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: text})
 			}
 		}
 	}
-	registerDeferred(lazySpecs, false)
-	registerDeferred(bgSpecs, true)
+
+	// Background: register placeholder tools now and kick off the real spawn.
+	// Everything shares the same pluginHost so /mcp status, hot-add, and Close
+	// see one cohesive set of servers.
+	registerBackground := func(specs []plugin.Spec) {
+		for _, s := range specs {
+			// Already running on the shared host? Register tools directly.
+			if pluginHost.HasClient(s.Name) {
+				tools, err := pluginHost.ToolsFor(ctx, s.Name)
+				if err == nil {
+					for _, t := range tools {
+						reg.Add(t)
+					}
+					continue
+				}
+			}
+			if opts.SharedHost != nil {
+				// Shared host relies on Host's spawn guard to avoid duplicate
+				// processes across tabs for the same workspace root.
+				cs, _ := plugin.LoadCachedSchema(s.Name, plugin.SpecFingerprint(s))
+				for _, t := range plugin.LazyToolset(s, cs, pluginHost, reg, ctx, true) {
+					reg.Add(t)
+				}
+			} else {
+				cs, _ := plugin.LoadCachedSchema(s.Name, plugin.SpecFingerprint(s))
+				for _, t := range plugin.LazyToolset(s, cs, pluginHost, reg, ctx, true) {
+					reg.Add(t)
+				}
+			}
+		}
+	}
+	registerBackground(bgSpecs)
 
 	for _, msg := range demoteMessages {
 		sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: msg})
 	}
 
 	cleanup := pluginHost.Close
+	if opts.SharedHost != nil {
+		// The caller owns the shared host's lifecycle; the controller must not
+		// close it. A no-op cleanup keeps Controller.Close happy without
+		// shutting down MCP processes that other controllers still use.
+		cleanup = func() {}
+	}
 
 	// LSP tools resolve their servers on PATH and spawn lazily on first query, so
 	// registering them is cheap even when no server is installed (a query then
@@ -448,13 +535,15 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			return "task tool is already enabled."
 		}
 		taskToolAdded = true
-		reg.Add(agent.NewTaskTool(execProv, entry.Price, reg, maxSteps,
+		tt := agent.NewTaskTool(execProv, entry.Price, reg, maxSteps,
 			entry.ContextWindow, cfg.Agent.RecentKeep, cfg.Agent.SoftCompactRatio, cfg.Agent.CompactRatio, cfg.Agent.CompactForceRatio,
 			cfg.Agent.Temperature, config.ArchiveDir(), "", headlessGate,
 			keepPolicy,
 			taskModel, taskEffort, resolveSubagentProvider).
 			WithTranscripts(subagentStore, root, modelName, entry.Effort).
-			WithTranscriptIdentityResolver(subagentIdentity))
+			WithTranscriptIdentityResolver(subagentIdentity)
+		reg.Add(tt)
+		reg.Add(agent.NewParallelTasksTool(tt, reg))
 		return "enabled task."
 	}
 	if !tokenEconomy {
@@ -465,6 +554,13 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// durable facts to the project's auto-memory store; `forget` prunes ones that
 	// turn out wrong. The saved index loads into the prefix on the next session.
 	reg.Add(history.NewTool(history.Options{SessionDir: sessionDir, GlobalSessionDir: config.SessionDir(), ArchiveDir: config.ArchiveDir()}))
+
+	// Session history tools let the AI discover and read past conversations.
+	// `list_sessions` returns all saved session files; `read_session` loads one
+	// and renders the full conversation as readable text.
+	reg.Add(sessiontool.NewListSessionsTool(sessionDir))
+	reg.Add(sessiontool.NewReadSessionTool(sessionDir))
+
 	reg.Add(memory.NewRecallTool(mem.Store))
 	reg.Add(memory.NewRememberTool(mem.Store))
 	reg.Add(memory.NewForgetTool(mem.Store))
@@ -711,6 +807,21 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				}
 				tools, err := pluginHost.Add(ctx, spec)
 				if err != nil {
+					// On a shared host the server may already be connected
+					// (e.g. another tab started it). Fall back to fetching
+					// its tools from the existing client.
+					if errors.Is(err, plugin.ErrServerAlreadyConnected) || errors.Is(err, plugin.ErrSpawningInFlight) {
+						tools, err2 := pluginHost.ToolsFor(ctx, spec.Name)
+						if err2 != nil {
+							return "", err2
+						}
+						reg.RemovePrefix(plugin.ToolPrefix(spec.Name))
+						names := addTools(reg, tools)
+						if len(names) == 0 {
+							return fmt.Sprintf("MCP server %q connected but exposed no tools.", spec.Name), nil
+						}
+						return fmt.Sprintf("enabled MCP server %q tools: %s.", spec.Name, strings.Join(names, ", ")), nil
+					}
 					return "", err
 				}
 				reg.RemovePrefix(plugin.ToolPrefix(spec.Name))
@@ -726,26 +837,40 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 
 	execSess := agent.NewSession(sysPrompt)
 	executor := agent.New(execProv, reg, execSess, agent.Options{
-		MaxSteps:          maxSteps,
-		Temperature:       cfg.Agent.Temperature,
-		Pricing:           entry.Price,
-		Gate:              headlessGate,
-		Hooks:             hookRunner,
-		Jobs:              jm,
-		ProjectChecks:     projectChecks,
-		ContextWindow:     entry.ContextWindow,
-		SoftCompactRatio:  cfg.Agent.SoftCompactRatio,
-		CompactRatio:      cfg.Agent.CompactRatio,
-		CompactForceRatio: cfg.Agent.CompactForceRatio,
-		RecentKeep:        cfg.Agent.RecentKeep,
-		ArchiveDir:        config.ArchiveDir(),
-		KeepPolicy:        keepPolicy,
-		ReasoningLanguage: cfg.ReasoningLanguage(),
+		MaxSteps:             maxSteps,
+		Temperature:          cfg.Agent.Temperature,
+		Pricing:              entry.Price,
+		Gate:                 headlessGate,
+		Hooks:                hookRunner,
+		Jobs:                 jm,
+		ProjectChecks:        projectChecks,
+		ContextWindow:        entry.ContextWindow,
+		SoftCompactRatio:     cfg.Agent.SoftCompactRatio,
+		CompactRatio:         cfg.Agent.CompactRatio,
+		CompactForceRatio:    cfg.Agent.CompactForceRatio,
+		RecentKeep:           cfg.Agent.RecentKeep,
+		ArchiveDir:           config.ArchiveDir(),
+		KeepPolicy:           keepPolicy,
+		ReasoningLanguage:    cfg.ReasoningLanguage(),
+		PlanModeAllowedTools: cfg.Agent.PlanModeAllowedTools,
 	}, sink)
 
 	var runner agent.Runner = executor
 	label := entry.Model
 	var classifier *control.ProviderAutoPlanClassifier
+
+	if !tokenEconomy && !strings.EqualFold(strings.TrimSpace(cfg.Agent.AutoPlan), "off") && cfg.Agent.AutoPlanClassifier != "" {
+		cm := cfg.Agent.AutoPlanClassifier
+		ce, ok := cfg.ResolveModel(cm)
+		if !ok {
+			return nil, fmt.Errorf("auto_plan_classifier %q is not a configured provider", cm)
+		}
+		classifierProv, err := NewProviderWithProxy(ce, proxySpec)
+		if err != nil {
+			return nil, fmt.Errorf("auto_plan_classifier %q: %w", cm, err)
+		}
+		classifier = control.NewBillableProviderAutoPlanClassifier(classifierProv, ce.Price, sink)
+	}
 
 	// Two-model collaboration: a distinct planner_model wraps the executor in a
 	// Coordinator with its own session, kept separate for cache stability. The
@@ -775,21 +900,9 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				ArchiveDir:        config.ArchiveDir(),
 				KeepPolicy:        keepPolicy,
 				ReasoningLanguage: cfg.ReasoningLanguage(),
-			}, executor, cfg.Agent.Temperature, sink, control.TaskWarrantsPlanner)
+			}, executor, cfg.Agent.Temperature, sink, control.NewPlannerGate(classifier))
 			label = entry.Model + " + planner " + pe.Model
 		}
-	}
-	if !tokenEconomy && !strings.EqualFold(strings.TrimSpace(cfg.Agent.AutoPlan), "off") && cfg.Agent.AutoPlanClassifier != "" {
-		cm := cfg.Agent.AutoPlanClassifier
-		ce, ok := cfg.ResolveModel(cm)
-		if !ok {
-			return nil, fmt.Errorf("auto_plan_classifier %q is not a configured provider", cm)
-		}
-		classifierProv, err := NewProviderWithProxy(ce, proxySpec)
-		if err != nil {
-			return nil, fmt.Errorf("auto_plan_classifier %q: %w", cm, err)
-		}
-		classifier = control.NewBillableProviderAutoPlanClassifier(classifierProv, ce.Price, sink)
 	}
 
 	ctrlOpts := control.Options{
@@ -821,6 +934,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		ReasoningLanguage:      cfg.ReasoningLanguage(),
 		DisableColdResumePrune: !cfg.ColdResumePruneEnabled(),
 		Shell:                  shell,
+		PlanModeAllowedTools:   cfg.Agent.PlanModeAllowedTools,
+		ApprovalTimeout:        opts.ApprovalTimeout,
 		OnRemember: func(rule string) control.RememberResult {
 			return rememberPermissionRule(root, rule)
 		},
@@ -1128,23 +1243,19 @@ func builtinToolEnabled(enabled []string, name string) bool {
 	return false
 }
 
-// partitionByTier splits configured plugin entries into the three startup
-// buckets — eager (block boot until ready), lazy (placeholder until first
-// model use), background (placeholder + start spawn now). Entries with an
-// empty tier land in background; unrecognised non-empty tiers land in lazy so a
-// typo never triggers unexpected background work.
-func partitionByTier(entries []config.PluginEntry) (eager, lazy, bg []config.PluginEntry) {
+// partitionByTier splits configured plugin entries into eager (block boot until
+// ready) and background (placeholder + start spawn now). Entries with an empty,
+// legacy lazy, or unrecognised tier land in background.
+func partitionByTier(entries []config.PluginEntry) (eager, bg []config.PluginEntry) {
 	for _, e := range entries {
 		switch e.ResolvedTier() {
 		case "eager":
 			eager = append(eager, e)
-		case "background":
-			bg = append(bg, e)
 		default:
-			lazy = append(lazy, e)
+			bg = append(bg, e)
 		}
 	}
-	return eager, lazy, bg
+	return eager, bg
 }
 
 // PluginSpecs maps configured plugin entries to plugin.Spec, expanding ${VAR}

@@ -175,6 +175,9 @@ func TestReadFileRef(t *testing.T) {
 	if got, _, err := readFileRef(imagePath, ""); err != nil || !strings.Contains(got, "image file") {
 		t.Errorf("image file = (%q, %v), want an image note", got, err)
 	}
+	if got, _, err := readFileRef(imagePath, ""); err != nil || !strings.Contains(got, "not attached as model image input") || strings.Contains(got, "attached to this turn as model image input") {
+		t.Errorf("unscoped image file = (%q, %v), want a non-attached image note", got, err)
+	}
 
 	// Large file: truncated with a marker.
 	if got, _, err := readFileRef(bigPath, ""); err != nil || !strings.Contains(got, "truncated") {
@@ -383,6 +386,63 @@ func TestResolveBareNamesWithWorkspaceRoot(t *testing.T) {
 	}
 }
 
+func TestResolveBareNamesSkipsAlreadyResolvedRefs(t *testing.T) {
+	refs := []ref{{kind: refFile, raw: "main.go", path: "main.go"}}
+
+	resolved := resolveBareNames(refs, t.TempDir())
+
+	if len(resolved) != 1 {
+		t.Fatalf("expected 1 ref, got %d", len(resolved))
+	}
+	if resolved[0].path != "main.go" {
+		t.Fatalf("already resolved ref path = %q, want main.go", resolved[0].path)
+	}
+}
+
+func TestResolveBareNamesWithWorkspaceRootStoresRootFilePath(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	refs := []ref{{kind: refFile, raw: "main.go"}}
+	resolved := resolveBareNames(refs, root)
+
+	if len(resolved) != 1 {
+		t.Fatalf("expected 1 ref, got %d", len(resolved))
+	}
+	if resolved[0].path != "main.go" {
+		t.Fatalf("root workspace ref path = %q, want main.go", resolved[0].path)
+	}
+}
+
+func TestResolveBareNamesRejectsUnsafeBareNames(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "safe.txt"), []byte("safe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bad..name.txt"), []byte("unsafe"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	refs := []ref{
+		{kind: refFile, raw: "safe.txt"},
+		{kind: refFile, raw: "bad..name.txt"},
+		{kind: refFile, raw: ".."},
+	}
+	resolved := resolveBareNames(refs, root)
+
+	if resolved[0].path != "safe.txt" {
+		t.Fatalf("safe bare name path = %q, want safe.txt", resolved[0].path)
+	}
+	if resolved[1].path != "" {
+		t.Fatalf("unsafe bare name should stay unresolved, got %q", resolved[1].path)
+	}
+	if resolved[2].path != "" {
+		t.Fatalf("parent-dir bare name should stay unresolved, got %q", resolved[2].path)
+	}
+}
+
 func TestResolveAbsRef(t *testing.T) {
 	temp := t.TempDir()
 
@@ -491,7 +551,7 @@ func TestResolveRefsWithWorkspaceRootStoresRelativePath(t *testing.T) {
 	}
 }
 
-func TestWorkspaceImageRefsOnlyTreatAttachmentsAsImages(t *testing.T) {
+func TestWorkspaceImageRefsAlsoAttachAsModelImages(t *testing.T) {
 	workspace := t.TempDir()
 	diagram := filepath.Join(workspace, "docs", "diagram.png")
 	if err := os.MkdirAll(filepath.Dir(diagram), 0o755); err != nil {
@@ -524,8 +584,27 @@ func TestWorkspaceImageRefsOnlyTreatAttachmentsAsImages(t *testing.T) {
 	if len(errs) != 0 {
 		t.Fatalf("ResolveRefs errors = %v", errs)
 	}
-	if !strings.Contains(block, `<file path="docs/diagram.png">`) || !strings.Contains(block, "image file docs/diagram.png") {
-		t.Fatalf("workspace png should resolve as image-file metadata:\n%s", block)
+	if !strings.Contains(block, `<file path="docs/diagram.png">`) || !strings.Contains(block, "attached to this turn as model image input") || strings.Contains(block, "OCR") {
+		t.Fatalf("workspace png should resolve as attached image-file metadata without OCR guidance:\n%s", block)
+	}
+	if urls := c.inputImages("see @" + diagram); len(urls) != 1 || !strings.HasPrefix(urls[0], "data:image/png;base64,") {
+		t.Fatalf("workspace png inputImages = %v, want one png data URL", urls)
+	}
+}
+
+func TestResolveRefsWithoutWorkspaceDoesNotClaimImageAttachment(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "shot.png")
+	if err := os.WriteFile(imagePath, []byte("\x89PNG\r\n\x1a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	block, errs := New(Options{}).ResolveRefs(context.Background(), "see @"+imagePath)
+	if len(errs) != 0 {
+		t.Fatalf("ResolveRefs errors = %v", errs)
+	}
+	if !strings.Contains(block, "not attached as model image input") || strings.Contains(block, "attached to this turn as model image input") {
+		t.Fatalf("unscoped image ref should not claim model image attachment:\n%s", block)
 	}
 }
 

@@ -80,7 +80,7 @@ type Config struct {
 ```
 
 - The `openai` kind is an OpenAI-compatible `/chat/completions` implementation.
-- **DeepSeek and MiMo are not code — they are config instances** of `kind = "openai"`,
+- **OpenAI-compatible vendors are config instances** of `kind = "openai"`,
   differing only in `base_url` / `model` / `api_key_env`. Adding another OpenAI-
   compatible model is a config edit, not a code change.
 - **A provider is a vendor endpoint** (one `base_url` + `api_key_env`) that offers
@@ -336,18 +336,20 @@ func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Dec
   stops it, or the safety continuation limit is reached. Blocked-state matching
   is normalized for casing, whitespace, and punctuation so minor wording drift
   does not reset the audit; restarting a goal begins a fresh blocked audit.
-  A goal-mode reply missing its `[goal:*]` status marker is tolerated once;
-  two in a row pause the goal (objective kept) instead of silently burning
-  continuation turns. `/goal pause` suspends a running goal, `/goal resume`
-  continues a paused or blocked one with a fresh audit, and cancelling a turn
-  mid-goal pauses rather than kills it. `/goal clear` removes it. The full
-  goal state (text, status, progress counters) mirrors into the session's
-  branch-meta sidecar on every change, so resuming a session restores its
-  goal — always as paused, never auto-running — while attaching to a session
-  without a stored goal clears any carry-over. Switching into plan/normal mode
-  clears the active goal in the desktop UI so the collaboration mode remains
-  one of the three choices, while the underlying tool approval posture is
-  preserved.
+  Goals that look like long-horizon research, debugging, optimization, or
+  implementation work automatically add an AutoResearch protocol to the same
+  transient active-goal user block. AutoResearch is a Goal strategy, not a
+  standalone global skill: it writes project-local state under
+  `.reasonix/autoresearch/YYYYMMDD-HHMMSS-slug/` and keeps dynamic run state out
+  of `REASONIX.md`, `AGENTS.md`, project memory, tool schemas, and the
+  cache-stable system prompt. `/goal --research <objective>` forces that
+  strategy; `/goal --simple <objective>` forces lightweight Goal. Outside goal
+  mode, an ordinary prompt with a very strong AutoResearch signal is upgraded by
+  the host into the equivalent of `/goal --research <original prompt>`. `/goal
+  pause` suspends a running goal, `/goal resume` continues a paused or blocked
+  one, and `/goal clear` removes the active goal. Switching into plan/normal mode
+  clears the active goal in the desktop UI so the collaboration mode remains one
+  of the three choices, while the underlying tool approval posture is preserved.
 
 | Tool approval posture | Tool approvals | Plan approval | `ask` questions |
 | --- | --- | --- | --- |
@@ -470,14 +472,16 @@ Resolution order: **flag > project `./reasonix.toml` > the user config file
 at `~/.reasonix/config.toml` on macOS/Linux and
 `%AppData%\reasonix\config.toml` on Windows. See
 [Configuration paths](./CONFIG_PATHS.md) for migration and related data paths.
+Fields marked user/global only, including agent step limits, are not overridden
+by project `reasonix.toml`.
 Secrets come from the environment via `api_key_env` and are never stored in
 config files. `credentials_store = "auto"` prefers the OS credential store and
 falls back to the file under Reasonix home. A `.env` in the working directory is
 loaded if present for compatibility and explicit per-project overrides, but
 Reasonix-created API keys are written to the configured credential store rather
-than a project `.env`. Step-limit preferences usually belong in the user config;
-project `reasonix.toml` should override them only when the repository needs
-shared runtime bounds.
+than a project `.env`. Step-limit preferences belong in the user config.
+Project `reasonix.toml` does not override `agent.max_steps` or
+`agent.planner_max_steps`.
 
 ```toml
 default_model = "deepseek"   # provider name (→ its default model) or "provider/model"
@@ -485,11 +489,11 @@ default_model = "deepseek"   # provider name (→ its default model) or "provide
 
 [agent]
 system_prompt = "You are Reasonix, a coding agent..."  # or system_prompt_file = "..."
-max_steps         = 0    # executor tool-call rounds; 0 = no limit
-planner_max_steps = 12   # planner read-only tool-call rounds; 0 = no limit
+max_steps         = 0    # user/global only; executor tool-call rounds; 0 = no limit
+planner_max_steps = 0    # user/global only; planner read-only tool-call rounds; 0 = no limit
 temperature       = 0.0
 reasoning_language = "auto"       # visible reasoning text: auto|zh|en
-# planner_model = "mimo"   # optional: two-model collaboration (low-frequency planner)
+# planner_model = "deepseek-pro"   # optional: two-model collaboration (low-frequency planner)
 # subagent_model = "deepseek-pro"   # optional default for runAs=subagent skills
 # subagent_models = { review = "deepseek-pro", security_review = "deepseek-pro" }
 
@@ -503,20 +507,7 @@ default        = "deepseek-v4-flash"   # optional; defaults to models[0]
 api_key_env    = "DEEPSEEK_API_KEY"
 context_window = 1000000   # tokens; harness compacts older history near this limit (0 disables)
 
-# A single-model entry (use when a model needs its own base_url/context_window/price).
-[[providers]]
-name        = "mimo-pro"
-kind        = "openai"
-base_url    = "https://token-plan-cn.xiaomimimo.com/v1"
-model       = "mimo-v2.5-pro"
-api_key_env = "MIMO_API_KEY"
-
-[[providers]]
-name        = "mimo-flash"
-kind        = "openai"
-base_url    = "https://token-plan-cn.xiaomimimo.com/v1"
-model       = "mimo-v2.5"
-api_key_env = "MIMO_API_KEY"
+# A single-model entry still works for custom OpenAI-compatible endpoints.
 
 [tools]
 enabled = []   # omit/empty = all built-ins

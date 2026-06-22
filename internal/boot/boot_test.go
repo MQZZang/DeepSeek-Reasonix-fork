@@ -95,6 +95,45 @@ api_key_env = "REASONIX_TEST_KEY_UNSET"
 	}
 }
 
+func TestBuildRunsCleanupPendingReconciler(t *testing.T) {
+	isolateConfigHome(t)
+	dir := robustTempDir(t)
+	t.Chdir(dir)
+
+	writeFile(t, dir, "reasonix.toml", `
+default_model = "test-model"
+
+[agent]
+system_prompt = "BASE"
+
+[[providers]]
+name = "test-model"
+kind = "openai"
+base_url = "https://example.invalid"
+model = "x"
+api_key_env = "REASONIX_TEST_KEY_UNSET"
+`)
+	sessionDir := filepath.Join(t.TempDir(), "sessions")
+	called := false
+	ctrl, err := Build(context.Background(), Options{
+		SessionDir: sessionDir,
+		CleanupPendingReconciler: func(got string) error {
+			called = true
+			if filepath.Clean(got) != filepath.Clean(sessionDir) {
+				t.Fatalf("reconciler dir = %q, want %q", got, sessionDir)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer ctrl.Close()
+	if !called {
+		t.Fatal("cleanup-pending reconciler was not called")
+	}
+}
+
 func TestBuildRegistersUsableHistoryAndMemoryRetrievalTools(t *testing.T) {
 	isolateConfigHome(t)
 	dir := robustTempDir(t)
@@ -1026,11 +1065,13 @@ command = "reasonix-missing-mockmcp"
 		"grep",
 		"history",
 		"kill_shell",
+		"list_sessions",
 		"ls",
 		"memory",
 		"move_file",
 		"multi_edit",
 		"read_file",
+		"read_session",
 		"remember",
 		"slash_command",
 		"todo_write",
@@ -1832,11 +1873,9 @@ func isolateConfigHome(t *testing.T) string {
 }
 
 // TestPartitionByTier pins the bucket assignment contract that the rest of
-// boot.go's plugin orchestration depends on: each tier string maps to its own
-// slice, the original order inside a tier is preserved (so /mcp status and
-// stats land deterministically), an empty/missing tier defaults to background
-// (connects after session start without blocking chat), and unknown non-empty
-// values fall back to lazy so a typo never forces unwanted background connects.
+// boot.go's plugin orchestration depends on: eager keeps its blocking startup
+// slice, while empty, background, legacy lazy, and unknown tiers all warm up in
+// the background.
 func TestPartitionByTier(t *testing.T) {
 	entries := []config.PluginEntry{
 		{Name: "e1", Tier: "eager"},
@@ -1845,16 +1884,13 @@ func TestPartitionByTier(t *testing.T) {
 		{Name: "default", Tier: ""}, // empty defaults to background
 	}
 
-	eager, lazy, bg := partitionByTier(entries)
+	eager, bg := partitionByTier(entries)
 
 	if len(eager) != 1 || eager[0].Name != "e1" {
 		t.Fatalf("eager bucket = %+v, want [e1]", eager)
 	}
-	if len(bg) != 2 || bg[0].Name != "b1" || bg[1].Name != "default" {
-		t.Fatalf("background bucket = %+v, want [b1, default] preserving input order", bg)
-	}
-	if len(lazy) != 1 || lazy[0].Name != "l1" {
-		t.Fatalf("lazy bucket = %+v, want [l1]", lazy)
+	if len(bg) != 3 || bg[0].Name != "l1" || bg[1].Name != "b1" || bg[2].Name != "default" {
+		t.Fatalf("background bucket = %+v, want [l1, b1, default] preserving input order", bg)
 	}
 }
 
@@ -2077,13 +2113,13 @@ tier = "eager"
 
 	foundDemoteNotice := false
 	for _, n := range notices {
-		if strings.Contains(n.Text, "demoting to lazy") {
+		if strings.Contains(n.Text, "lazy") {
 			foundDemoteNotice = true
 			break
 		}
 	}
 	if foundDemoteNotice {
-		t.Fatalf("legacy tier should be migrated before demotion logic; got notices %+v", notices)
+		t.Fatalf("demotion notice should not mention legacy lazy tier; got notices %+v", notices)
 	}
 }
 

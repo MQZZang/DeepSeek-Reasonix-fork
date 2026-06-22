@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"strings"
+	"unicode"
 
 	"reasonix/internal/agent"
 	"reasonix/internal/skill"
@@ -72,9 +73,13 @@ const (
 	GoalStatusPaused = "paused"
 )
 
-// GoalContinuePrompt is the synthetic user turn that resumes a goal loop after
-// /goal resume or an auto-continue iteration.
-const GoalContinuePrompt = "Continue pursuing the active goal. If it is complete, provide the concise final result and end with [goal:complete]. If it is truly blocked on a user-owned decision after trying sensible defaults, end with [goal:blocked:<short reason>]. Otherwise do the next useful work and end with [goal:continue]."
+type GoalResearchMode int
+
+const (
+	GoalResearchAuto GoalResearchMode = iota
+	GoalResearchOn
+	GoalResearchOff
+)
 
 // StripComposePrefixes removes controller-injected prefixes from a composed
 // user message so that the display text matches what the user actually typed.
@@ -90,6 +95,48 @@ func StripComposePrefixes(content string) string {
 	s = strings.TrimPrefix(s, AskModeMarker+"\n\n")
 	s = strings.TrimPrefix(s, AskModeMarker)
 	s = strings.TrimSpace(s)
+	return s
+}
+
+// StripReferencedContextPrefix removes the "Referenced context:" preamble and
+// the trailing XML reference blocks (<file>, <dir>, <resource>, <image>) that
+// controller.ResolveRefs injects when the user @-references files or resources.
+// The user's actual input follows the reference blocks after a blank line.
+// Used for title generation and previews so the displayed text matches what
+// the user typed, not the injected context preamble (#4954).
+func StripReferencedContextPrefix(content string) string {
+	const preamble = "Referenced context:"
+	s := strings.TrimSpace(content)
+	if !strings.HasPrefix(s, preamble) {
+		return content
+	}
+	// Skip past the preamble.
+	s = strings.TrimSpace(s[len(preamble):])
+	// Skip past all XML reference blocks: <file ...>...</file>, <dir ...>...</dir>,
+	// <resource ...>...</resource>, <image ...>...</image>.
+	for {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return ""
+		}
+		// Check for a reference block start.
+		if !strings.HasPrefix(s, "<file ") && !strings.HasPrefix(s, "<dir ") &&
+			!strings.HasPrefix(s, "<resource ") && !strings.HasPrefix(s, "<image ") {
+			break
+		}
+		// Find the matching close tag.
+		tagEnd := strings.IndexByte(s, ' ')
+		if tagEnd < 0 {
+			break
+		}
+		tagName := s[1:tagEnd]
+		closeTag := "</" + tagName + ">"
+		closeIdx := strings.Index(s, closeTag)
+		if closeIdx < 0 {
+			break
+		}
+		s = strings.TrimSpace(s[closeIdx+len(closeTag):])
+	}
 	return s
 }
 
@@ -111,7 +158,7 @@ func IsSyntheticUserMessage(content string) bool {
 }
 
 // syntheticPrefixes must be kept in sync with the synthetic user messages
-// injected by the controller (planApprovedMessage), agent loop
+// injected by the controller (planApprovedMessage, goal loop turns), agent loop
 // (streamRecoveryMessage, finalReadinessRetryMessage, emptyFinalRetryMessage,
 // executorHandoffRetryMessage in internal/agent/agent.go), and compaction
 // folds (internal/agent/compact.go), which store summaries as user-role
@@ -129,6 +176,10 @@ var syntheticPrefixes = []string{
 	"<compaction-summary>",
 	"Summary of the later conversation (compacted from here on):",
 	"Summary of earlier conversation (compacted up to here):",
+	"Continue pursuing the active goal.",
+	"The agent signaled goal completion and all tasks are marked done.",
+	"Goal signaled complete but issues remain:",
+	"No tool calls in recent turns.",
 }
 
 // Compose applies the collaboration-mode marker to a turn's text when plan or
@@ -137,15 +188,14 @@ var syntheticPrefixes = []string{
 func (c *Controller) Compose(text string) string {
 	c.mu.Lock()
 	collab := c.collabMode
-	goal := c.goal
-	goalStatus := c.goalStatus
 	reasoningLanguage := c.reasoningLanguage
 	notes := c.pendingMemory
 	c.pendingMemory = nil
 	c.mu.Unlock()
+	goal, goalStatus, goalResearchMode := c.goals.snapshot()
 
 	if strings.TrimSpace(goal) != "" && goalStatus == GoalStatusRunning {
-		text = activeGoalBlock(goal) + "\n\n" + text
+		text = activeGoalBlock(goal, goalResearchMode) + "\n\n" + text
 	}
 	switch collab {
 	case CollabPlan:
@@ -191,7 +241,7 @@ func (c *Controller) ComposeSynthetic(text string) string {
 	return agent.WithReasoningLanguage(text, lang)
 }
 
-func activeGoalBlock(goal string) string {
+func activeGoalBlock(goal string, researchMode GoalResearchMode) string {
 	goal = strings.TrimSpace(goal)
 	goal = strings.ReplaceAll(goal, activeGoalClose, "<\\/active-goal>")
 	var b strings.Builder
@@ -200,9 +250,166 @@ func activeGoalBlock(goal string) string {
 	b.WriteString(goal)
 	b.WriteString("\n\n")
 	b.WriteString("Goal mode: pursue this goal autonomously. Keep working across turns until the goal is complete. Prefer sensible defaults over asking the user; use ask only when you are truly blocked on a user-owned decision. Do not stop after describing a plan; execute the next useful step. End every goal-mode assistant reply with exactly one status marker on its own line: [goal:continue], [goal:complete], or [goal:blocked:<short reason>].")
+	if shouldUseAutoResearch(goal, researchMode) {
+		b.WriteString("\n\n")
+		b.WriteString(autoResearchGoalInstructions)
+	}
 	b.WriteString("\n")
 	b.WriteString(activeGoalClose)
 	return b.String()
+}
+
+const autoResearchGoalInstructions = `AutoResearch protocol: this goal looks like long-horizon research, debugging, optimization, or implementation work. Treat AutoResearch as a durable strategy for this Goal, not as a background daemon or a global skill.
+- Say briefly in the first visible reply that the goal is being handled with AutoResearch and that state will live under .reasonix/autoresearch/<task-id>/.
+- Keep dynamic state out of REASONIX.md, AGENTS.md, project memory, system prompts, and tool schemas. Use project-local .reasonix/autoresearch/ state only.
+- For a new task, create a collision-resistant task id YYYYMMDD-HHMMSS-slug, check .reasonix/autoresearch/ first, and append -2, -3, etc. only on collision. Reuse an explicitly supplied .reasonix/autoresearch/<task-id>/ path exactly.
+- Maintain state/task_spec.md, state/progress.json, state/findings.jsonl, state/directions_tried.json, state/iteration_log.jsonl, and logs/heartbeat.jsonl. Record goal, scope, non-goals, allowed operations, success criteria, verification gates, iteration direction, evidence, stale_count, pivots, blockers, and completion summary.
+- Before each iteration, read the existing state files as authoritative, append a heartbeat, choose a direction that differs materially from directions already tried, execute the smallest evidence-producing chunk, verify it, then persist JSON/JSONL state before reporting.
+- Increment stale_count when an iteration lacks accepted evidence or repeats a prior direction. At stale_count >= 2, make a structural pivot such as changing evidence source, entrypoint, implementation boundary, test oracle, benchmark, decomposition, environment, platform, or refutation angle. At stale_count >= 4, stop autonomous digging and ask for the smallest external input needed.
+- Workers or subagents may gather evidence, but the orchestrator owns canonical state writes. Workers must not publish, push, delete, contact external systems, or write canonical state unless explicitly designated.
+- Complete only after auditing every success criterion in task_spec.md against direct evidence. Public publishing, destructive changes, credential use, payments, external notifications, privacy-sensitive output, and cache-sensitive changes still require the normal Reasonix gates.`
+
+func shouldUseAutoResearch(goal string, mode GoalResearchMode) bool {
+	switch mode {
+	case GoalResearchOn:
+		return true
+	case GoalResearchOff:
+		return false
+	}
+	return isAutoResearchGoal(goal)
+}
+
+func shouldAutoStartResearchGoal(input string) bool {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" || strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "!") {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, ".reasonix/autoresearch/") {
+		return true
+	}
+	for _, phrase := range autoResearchAutoStartPhrases {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	categories := autoResearchPhaseCount(lower)
+	switch {
+	case strings.Contains(lower, "彻底") && categories >= 3:
+		return true
+	case strings.Contains(lower, "完整") && categories >= 3:
+		return true
+	case strings.Contains(lower, "长期") && categories >= 2 && containsAnyGoalKeyword(lower, []string{"实验", "验证", "修复", "排查", "优化"}):
+		return true
+	case strings.Contains(lower, "thoroughly") && categories >= 3:
+		return true
+	case strings.Contains(lower, "complete") && categories >= 3:
+		return true
+	}
+	return false
+}
+
+func isAutoResearchGoal(goal string) bool {
+	trimmed := strings.TrimSpace(goal)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, ".reasonix/autoresearch/") {
+		return true
+	}
+	for _, kw := range autoResearchStrongKeywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return autoResearchPhaseCount(lower) >= 4
+}
+
+func autoResearchPhaseCount(lower string) int {
+	categories := 0
+	for _, group := range autoResearchPhaseKeywords {
+		if containsAnyGoalKeyword(lower, group) {
+			categories++
+		}
+	}
+	return categories
+}
+
+var autoResearchAutoStartPhrases = []string{
+	"直到根因",
+	"根因明确",
+	"多轮排查",
+	"不要原地打转",
+	"别原地打转",
+	"完整做成方案",
+	"完整方案并验证",
+	"跑实验",
+	"反复验证",
+	"系统性研究",
+	"持续研究",
+	"持续排查",
+	"持续推进",
+	"长期跑",
+	"until the root cause",
+	"root cause is clear",
+	"debug until",
+	"do not spin",
+	"don't spin",
+	"keep researching",
+	"long-horizon",
+	"long horizon",
+	"long-running",
+}
+
+var autoResearchStrongKeywords = []string{
+	"持续",
+	"长期",
+	"彻底",
+	"直到根因",
+	"根因明确",
+	"多轮",
+	"不要原地打转",
+	"别原地打转",
+	"完整方案",
+	"完整做成方案",
+	"跑实验",
+	"反复验证",
+	"长期优化",
+	"系统性研究",
+	"持续研究",
+	"持续排查",
+	"持续推进",
+	"长期跑",
+	"long-horizon",
+	"long horizon",
+	"long-running",
+	"keep researching",
+	"keep working",
+	"root cause",
+	"until the root cause",
+	"do not spin",
+	"don't spin",
+	"thoroughly",
+	"systematically",
+}
+
+var autoResearchPhaseKeywords = [][]string{
+	{"研究", "调研", "排查", "分析", "定位", "诊断", "research", "investigate", "diagnose", "analyze", "analysis"},
+	{"实现", "修复", "改造", "开发", "重构", "implement", "build", "fix", "refactor"},
+	{"验证", "测试", "复现", "联调", "benchmark", "verify", "validate", "test", "reproduce"},
+	{"优化", "完善", "提升", "收敛", "optimize", "improve", "tune", "polish"},
+	{"文档", "方案", "说明", "总结", "document", "docs", "writeup", "plan"},
+	{"发布", "上线", "提交", "pull request", "publish", "ship", "deploy"},
+}
+
+func containsAnyGoalKeyword(s string, needles []string) bool {
+	for _, needle := range needles {
+		if strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // MemoryQuickAddNote parses the "# <note>" memory shortcut. The space after
@@ -246,8 +453,10 @@ const (
 )
 
 type GoalCommand struct {
-	Action GoalCommandAction
-	Text   string
+	Action       GoalCommandAction
+	Text         string
+	Strict       bool
+	ResearchMode GoalResearchMode
 }
 
 // ParseGoalCommand parses the "/goal" family. Bare keywords act on the active
@@ -259,17 +468,19 @@ func ParseGoalCommand(input string) (GoalCommand, bool) {
 		return GoalCommand{}, false
 	}
 	args := strings.TrimSpace(trimmed[len("/goal"):])
-	switch strings.ToLower(args) {
+	strict, researchMode, actionArgs := parseLeadingGoalFlags(args)
+
+	switch strings.ToLower(actionArgs) {
 	case "", "status":
-		return GoalCommand{Action: GoalCommandStatus}, true
+		return GoalCommand{Action: GoalCommandStatus, Strict: strict, ResearchMode: researchMode}, true
 	case "clear", "off", "stop", "done":
-		return GoalCommand{Action: GoalCommandClear}, true
+		return GoalCommand{Action: GoalCommandClear, Strict: strict, ResearchMode: researchMode}, true
 	case "pause":
-		return GoalCommand{Action: GoalCommandPause}, true
+		return GoalCommand{Action: GoalCommandPause, Strict: strict, ResearchMode: researchMode}, true
 	case "resume", "continue":
-		return GoalCommand{Action: GoalCommandResume}, true
+		return GoalCommand{Action: GoalCommandResume, Strict: strict, ResearchMode: researchMode}, true
 	default:
-		return GoalCommand{Action: GoalCommandSet, Text: args}, true
+		return GoalCommand{Action: GoalCommandSet, Text: actionArgs, Strict: strict, ResearchMode: researchMode}, true
 	}
 }
 
@@ -304,6 +515,36 @@ func ParseAskCommand(input string) (AskCommand, bool) {
 	}
 }
 
+func parseLeadingGoalFlags(args string) (bool, GoalResearchMode, string) {
+	strict := false
+	mode := GoalResearchAuto
+	rest := strings.TrimLeftFunc(args, unicode.IsSpace)
+	for rest != "" {
+		token, after := leadingGoalToken(rest)
+		switch strings.ToLower(token) {
+		case "--strict":
+			strict = true
+		case "--research", "--auto-research", "--deep":
+			mode = GoalResearchOn
+		case "--simple", "--no-research":
+			mode = GoalResearchOff
+		default:
+			return strict, mode, strings.TrimSpace(rest)
+		}
+		rest = strings.TrimLeftFunc(after, unicode.IsSpace)
+	}
+	return strict, mode, ""
+}
+
+func leadingGoalToken(s string) (string, string) {
+	for i, r := range s {
+		if unicode.IsSpace(r) {
+			return s[:i], s[i:]
+		}
+	}
+	return s, ""
+}
+
 // CustomCommand resolves a "/name args…" line against the loaded custom slash
 // commands, returning the rendered prompt to send (found=false when no command
 // matches). It does not apply the plan-mode marker — call Compose for that.
@@ -313,7 +554,7 @@ func (c *Controller) CustomCommand(input string) (sent string, found bool) {
 		return "", false
 	}
 	name := strings.TrimPrefix(fields[0], "/")
-	for _, cmd := range c.commands {
+	for _, cmd := range c.Commands() {
 		if cmd.Name == name {
 			return cmd.Render(fields[1:]), true
 		}

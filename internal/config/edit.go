@@ -203,8 +203,10 @@ func (c *Config) SetDesktopLayoutStyle(style string) error {
 		c.Desktop.LayoutStyle = "classic"
 	case "workbench", "workspace":
 		c.Desktop.LayoutStyle = "workbench"
+	case "creation":
+		c.Desktop.LayoutStyle = "creation"
 	default:
-		return fmt.Errorf("desktop layout style %q: must be classic|workbench", style)
+		return fmt.Errorf("desktop layout style %q: must be classic|workbench|creation", style)
 	}
 	return nil
 }
@@ -788,24 +790,6 @@ func (c *Config) SaveToScope(path string, scope RenderScope) error {
 	return writeConfigFile(path, RenderTOMLForScope(c, scope))
 }
 
-// SaveMinimalProjectAutoPlan writes a new project config that only overrides
-// [agent].auto_plan. It is intentionally minimal so toggling a project-local
-// auto-plan preference in an otherwise unconfigured workspace does not pin
-// default_model or providers from built-in defaults.
-func SaveMinimalProjectAutoPlan(path, mode string) (string, error) {
-	cfg := Default()
-	if err := cfg.SetAutoPlan(mode); err != nil {
-		return "", err
-	}
-	body := fmt.Sprintf(`# Reasonix project configuration.
-# Project-local overrides are merged over the user config.
-
-[agent]
-auto_plan = %q
-`, cfg.Agent.AutoPlan)
-	return cfg.Agent.AutoPlan, writeConfigFile(path, body)
-}
-
 // SaveMinimalProjectReasoningLanguage writes a new project config that only
 // overrides [agent].reasoning_language.
 func SaveMinimalProjectReasoningLanguage(path, lang string) (string, error) {
@@ -826,25 +810,14 @@ func writeConfigFile(path, body string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("save: empty config path")
 	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("save: create dir: %w", err)
+	return fileutil.AtomicWriteFile(path, []byte(body), configFilePerm(path))
+}
+
+func configFilePerm(path string) os.FileMode {
+	if isUserConfigPath(path) {
+		return 0o600
 	}
-	tmp, err := os.CreateTemp(dir, ".reasonix.*.toml.tmp")
-	if err != nil {
-		return fmt.Errorf("save: create temp: %w", err)
-	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.WriteString(body); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("save: write: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("save: close temp: %w", err)
-	}
-	return fileutil.ReplaceFile(tmpPath, path)
+	return 0o644
 }
 
 func renderScopeForPath(path string) RenderScope {

@@ -48,6 +48,7 @@ var Chinese = Messages{
 	ChatStatusThinkingFmt:       "%s 思考中… (%d 秒 · Esc 取消)",
 	ChatToolWorkingFmt:          "%s 运行中 · %d 秒",
 	ChatStatusRetryingFmt:       "%s 正在重试 (%d/%d)… (Esc 取消)",
+	ChatStatusCancellingFmt:     "%s 正在停止… (%d 秒 · Ctrl+C 退出)",
 	ChatStatusIdle:              "就绪",
 	ChatStatusYoloIdle:          "已跳过工具批准",
 	ChatStatusCycleHint:         "shift+tab 循环计划/问答 · ctrl+y yolo",
@@ -187,6 +188,7 @@ var Chinese = Messages{
 	CmdLanguage:     "切换 CLI 语言",
 	CmdSkill:        "管理 skills",
 	CmdVerbose:      "切换 thinking 原文显示",
+	CmdReloadCmd:    "重载自定义命令",
 	CmdDiffFold:     "切换 diff 折叠/展开",
 	CmdSandbox:      "查看沙箱状态",
 	CmdEffort:       "设置推理强度",
@@ -380,17 +382,19 @@ var Chinese = Messages{
 	UsageBody: `reasonix — 由配置和插件驱动的 coding agent（多模型）
 
 用法：
-  reasonix [--model NAME] [-c|--continue] [--resume]        交互式会话（多轮；-c 恢复最近一次，--resume 选择一个）
+  reasonix [--model NAME] [-c|--continue] [--resume] [--yolo] [--dir PATH]   交互式会话（多轮；-c 恢复最近一次，--resume 选择一个）
   reasonix run  [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] <task>   执行单次任务后退出
+  reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI 代码审查（基于本地 diff）
   reasonix serve [--model NAME] [--addr HOST:PORT]      通过 HTTP+SSE 提供会话（浏览器客户端在 /）
   reasonix acp [--model NAME]                           通过 stdio 提供 Agent Client Protocol（也可用：reasonix --acp）
   reasonix setup [path]                                 交互式配置向导；生成 reasonix.toml（及 .env）
   reasonix config auto-plan [off|on]                    配置自动计划模式
   reasonix config reasoning-language [auto|zh|en]        配置可见思考语言
-  reasonix mcp <add|remove|list>                        管理 reasonix.toml 里的 MCP 服务器
+  reasonix mcp <add|remove|list|import>                 管理 reasonix.toml 里的 MCP 服务器
+  reasonix init                                         查看如何生成项目记忆（AGENTS.md）
   reasonix doctor [--json]                              输出脱敏的本地诊断信息
   reasonix bot start|doctor|weixin-login                多渠道 IM bot 网关
-  reasonix upgrade [--check] [--force]                   自更新到最新版本
+  reasonix upgrade [--check] [--force]                   自更新到最新版本（也可用：reasonix update）
   reasonix version
   reasonix help
 

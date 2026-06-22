@@ -95,6 +95,13 @@ type Host struct {
 	deferredCancels []context.CancelFunc
 	deferredWG      sync.WaitGroup
 
+	// spawningMu + spawning prevent concurrent spawns of the same server from
+	// multiple callers (e.g. several controller tabs sharing one Host). The
+	// owner publishes its result before closing done so waiters can reuse the
+	// discovered tools without issuing concurrent tools/list calls.
+	spawningMu sync.Mutex
+	spawning   map[string]*spawnAttempt
+
 	// Detached stats/schema-cache writers from Start; off the boot path but
 	// drained by Close so cleanup can't race a still-open cache file.
 	bgWrites sync.WaitGroup
@@ -481,6 +488,7 @@ type Client struct {
 	// parallel startup can collect them per-client before merging into Host.
 	prompts   []Prompt
 	resources []Resource
+	toolsMu   sync.Mutex
 	tools     []ToolInfo
 }
 
@@ -553,6 +561,20 @@ func (h *Host) Failures() []Failure {
 	return out
 }
 
+// ConnectingServers returns server names whose startup handshake is currently in
+// flight. It is intentionally status-only: connected clients and failures remain
+// the source of truth for ready/issue states.
+func (h *Host) ConnectingServers() []string {
+	h.spawningMu.Lock()
+	defer h.spawningMu.Unlock()
+	out := make([]string, 0, len(h.spawning))
+	for name := range h.spawning {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // RecordFailure stores a failed MCP connection attempt for status UIs.
 func (h *Host) RecordFailure(s Spec, err error) {
 	h.mu.Lock()
@@ -619,6 +641,46 @@ func (h *Host) endDeferredSpawn() {
 	h.deferredWG.Done()
 }
 
+// ErrSpawningInFlight is returned by Host.Add when another caller is already
+// spawning the same server on this host. The caller should retry later.
+var ErrSpawningInFlight = errors.New("server spawn already in progress")
+
+type spawnAttempt struct {
+	done  chan struct{}
+	tools []tool.Tool
+	err   error
+}
+
+// beginSpawn atomically claims the sole right to spawn the named server.
+// Returns owner=true if the caller should proceed. When another caller is
+// already spawning the same server, owner=false and done is closed when that
+// spawn finishes.
+func (h *Host) beginSpawn(name string) (*spawnAttempt, bool) {
+	h.spawningMu.Lock()
+	defer h.spawningMu.Unlock()
+	if h.spawning == nil {
+		h.spawning = make(map[string]*spawnAttempt)
+	}
+	if attempt, ok := h.spawning[name]; ok {
+		return attempt, false
+	}
+	attempt := &spawnAttempt{done: make(chan struct{})}
+	h.spawning[name] = attempt
+	return attempt, true
+}
+
+// endSpawn releases the spawn claim for the named server.
+func (h *Host) endSpawn(name string, tools []tool.Tool, err error) {
+	h.spawningMu.Lock()
+	if attempt, ok := h.spawning[name]; ok {
+		attempt.tools = append([]tool.Tool(nil), tools...)
+		attempt.err = err
+		delete(h.spawning, name)
+		close(attempt.done)
+	}
+	h.spawningMu.Unlock()
+}
+
 // has reports whether a server with this name is already connected.
 func (h *Host) has(name string) bool {
 	h.mu.RLock()
@@ -635,6 +697,40 @@ func (h *Host) hasLocked(name string) bool {
 	return false
 }
 
+// HasClient reports whether a server with this name is already connected to the host.
+func (h *Host) HasClient(name string) bool { return h.has(name) }
+
+// ToolsFor returns the namespaced tool instances for an already-connected client.
+// ctx bounds the tools/list call so a non-responsive server does not hang
+// permanently. An error is returned when no client with that name is connected.
+func (h *Host) ToolsFor(ctx context.Context, name string) ([]tool.Tool, error) {
+	h.mu.RLock()
+	closed := h.closed
+	h.mu.RUnlock()
+	if closed {
+		return nil, fmt.Errorf("plugin host is closed")
+	}
+
+	// Attempt to resolve via the existing Client.
+	c := h.client(name)
+	if c == nil {
+		return nil, fmt.Errorf("client %q not found on shared host", name)
+	}
+	return c.listTools(ctx)
+}
+
+// client returns the named connected client, or nil.
+func (h *Host) client(name string) *Client {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, c := range h.clients {
+		if c.name == name {
+			return c
+		}
+	}
+	return nil
+}
+
 // Add connects one server live: it performs the MCP handshake, discovers the
 // server's tools (and prompts/resources when advertised), appends it to the
 // host, and returns its namespaced tools for the caller to register. ctx bounds a
@@ -644,10 +740,70 @@ func (h *Host) Add(ctx context.Context, s Spec) ([]tool.Tool, error) {
 	if h.has(s.Name) {
 		return nil, serverAlreadyConnectedError(s.Name)
 	}
-	return h.addConnected(ctx, s)
+	attempt, owner := h.beginSpawn(s.Name)
+	if !owner {
+		select {
+		case <-attempt.done:
+			if attempt.err != nil {
+				return nil, attempt.err
+			}
+			return append([]tool.Tool(nil), attempt.tools...), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	var tools []tool.Tool
+	var err error
+	defer func() { h.endSpawn(s.Name, tools, err) }()
+	// Double-check after acquiring the spawn token: another caller may have
+	// connected the server between our h.has check and beginSpawn.
+	if h.has(s.Name) {
+		err = serverAlreadyConnectedError(s.Name)
+		return nil, err
+	}
+	tools, err = h.addConnected(ctx, s)
+	return tools, err
+}
+
+// AddWithLifecycle connects one server live, allowing caller to specify separate
+// contexts for the subprocess lifecycle (lifeCtx, session-scoped) and the startup
+// handshake/list calls (callCtx, turn-scoped/timeout-bound).
+func (h *Host) AddWithLifecycle(lifeCtx, callCtx context.Context, s Spec) ([]tool.Tool, error) {
+	if h.has(s.Name) {
+		return nil, serverAlreadyConnectedError(s.Name)
+	}
+	attempt, owner := h.beginSpawn(s.Name)
+	if !owner {
+		select {
+		case <-attempt.done:
+			if attempt.err != nil {
+				return nil, attempt.err
+			}
+			return append([]tool.Tool(nil), attempt.tools...), nil
+		case <-callCtx.Done():
+			return nil, callCtx.Err()
+		case <-lifeCtx.Done():
+			return nil, lifeCtx.Err()
+		}
+	}
+	var tools []tool.Tool
+	var err error
+	defer func() { h.endSpawn(s.Name, tools, err) }()
+	// Double-check after acquiring the spawn token: another caller may have
+	// connected the server between our h.has check and beginSpawn.
+	if h.has(s.Name) {
+		err = serverAlreadyConnectedError(s.Name)
+		return nil, err
+	}
+	tools, err = h.addConnectedWithLifecycle(lifeCtx, callCtx, s)
+	return tools, err
 }
 
 func (h *Host) addConnected(ctx context.Context, s Spec) ([]tool.Tool, error) {
+	return h.addConnectedWithLifecycle(ctx, ctx, s)
+}
+
+func (h *Host) addConnectedWithLifecycle(lifeCtx, callCtx context.Context, s Spec) ([]tool.Tool, error) {
 	h.mu.RLock()
 	if h.closed {
 		h.mu.RUnlock()
@@ -655,11 +811,11 @@ func (h *Host) addConnected(ctx context.Context, s Spec) ([]tool.Tool, error) {
 	}
 	h.mu.RUnlock()
 
-	c, err := start(ctx, ctx, s)
+	c, err := start(lifeCtx, callCtx, s)
 	if err != nil {
 		return nil, err
 	}
-	ts, err := c.listTools(ctx)
+	ts, err := c.listTools(callCtx)
 	if err != nil {
 		c.close()
 		return nil, fmt.Errorf("list tools: %w", err)
@@ -679,15 +835,15 @@ func (h *Host) addConnected(ctx context.Context, s Spec) ([]tool.Tool, error) {
 	h.clients = append(h.clients, c)
 	h.clearFailure(s.Name)
 	h.mu.Unlock()
-	// Prompts and resources stream in on the long ctx the caller passed (Host.Add
+	// Prompts and resources stream in on the long lifeCtx the caller passed (Host.Add
 	// uses the session-scoped PluginCtx, not a per-turn ctx), so the slow list
 	// calls cannot starve a /mcp add of its return value. nil sink keeps hot-add
 	// quiet — the chat UI re-queries Host.Prompts()/Resources() on demand.
 	if c.hasPrompts {
-		go h.fetchPrompts(ctx, c, nil)
+		go h.fetchPrompts(lifeCtx, c, nil)
 	}
 	if c.hasResources {
-		go h.fetchResources(ctx, c, nil)
+		go h.fetchResources(lifeCtx, c, nil)
 	}
 	return ts, nil
 }
@@ -778,6 +934,13 @@ func newTransport(ctx context.Context, s Spec) (transport, error) {
 }
 
 func (c *Client) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	res, err := c.t.call(ctx, method, params)
+	if err == nil || method == "initialize" || !isHTTPSessionExpired(err) {
+		return res, err
+	}
+	if initErr := c.initializeSession(ctx, false); initErr != nil {
+		return nil, fmt.Errorf("%w; reinitialize failed: %v", err, initErr)
+	}
 	return c.t.call(ctx, method, params)
 }
 
@@ -787,7 +950,16 @@ func (c *Client) notify(ctx context.Context, method string, params any) error {
 
 func (c *Client) close() { c.t.close() }
 
+func isHTTPSessionExpired(err error) bool {
+	var expired *httpSessionExpiredError
+	return errors.As(err, &expired)
+}
+
 func (c *Client) initialize(ctx context.Context) error {
+	return c.initializeSession(ctx, true)
+}
+
+func (c *Client) initializeSession(ctx context.Context, recordCapabilities bool) error {
 	res, err := c.call(ctx, "initialize", map[string]any{
 		"protocolVersion": protocolVersion,
 		"capabilities":    map[string]any{},
@@ -795,6 +967,10 @@ func (c *Client) initialize(ctx context.Context) error {
 	})
 	if err != nil {
 		return err
+	}
+	if !recordCapabilities {
+		// Runtime session refresh must not rewrite startup-only capability flags.
+		return c.notify(ctx, "notifications/initialized", map[string]any{})
 	}
 	// Record which optional capabilities the server advertises. Presence of the
 	// key (even with an empty object) signals support.
@@ -828,6 +1004,9 @@ func (s Spec) toolReadOnly(rawName string, hinted bool) bool {
 }
 
 func (c *Client) listTools(ctx context.Context) ([]tool.Tool, error) {
+	c.toolsMu.Lock()
+	defer c.toolsMu.Unlock()
+
 	res, err := c.call(ctx, "tools/list", map[string]any{})
 	if err != nil {
 		return nil, err

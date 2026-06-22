@@ -355,6 +355,7 @@ export function TurnActions({
   checkpoint,
   actionPending = false,
   rewindDisabled = false,
+  hoverMenus = false,
 }: {
   text: string;
   turn?: number;
@@ -364,6 +365,7 @@ export function TurnActions({
   checkpoint?: CheckpointMeta;
   actionPending?: boolean;
   rewindDisabled?: boolean;
+  hoverMenus?: boolean;
 }) {
   const t = useT();
   const [confirmScope, setConfirmScope] = useState<MessageActionScope | null>(null);
@@ -461,9 +463,13 @@ export function TurnActions({
     setConfirmScope(null);
     onOpenMenu?.(openMenu === menu ? null : menu);
   };
-
+  const openHoverMenu = (menu: TurnActionMenu) => {
+    if (!hoverMenus || openMenu === menu) return;
+    setConfirmScope(null);
+    onOpenMenu?.(menu);
+  };
   return (
-    <div className="turn-actions">
+    <div className={`turn-actions${openMenu ? " turn-actions--open" : ""}${hoverMenus ? " turn-actions--hover-menu" : ""}`}>
       <CopyButton text={text} label={t("msg.copy")} />
       {canAct && (
         <>
@@ -477,7 +483,10 @@ export function TurnActions({
             <GitBranch size={13} />
             <span>{actionLabel("fork")}</span>
           </button>
-          <div className={`turn-actions__group${openMenu === "summary" ? " turn-actions__group--open" : ""}`}>
+          <div
+            className={`turn-actions__group${openMenu === "summary" ? " turn-actions__group--open" : ""}`}
+            onMouseEnter={() => openHoverMenu("summary")}
+          >
             <button
               className="turn-actions__btn"
               type="button"
@@ -498,7 +507,10 @@ export function TurnActions({
               </div>
             )}
           </div>
-          <div className={`turn-actions__group${openMenu === "rewind" ? " turn-actions__group--open" : ""}`}>
+          <div
+            className={`turn-actions__group${openMenu === "rewind" ? " turn-actions__group--open" : ""}`}
+            onMouseEnter={() => openHoverMenu("rewind")}
+          >
             <button
               className="turn-actions__btn"
               type="button"
@@ -531,6 +543,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   defaultExpanded = false,
   expandWhileStreaming = true,
   truncateStreamingReasoning = false,
+  creationMode = false,
 }: {
   item: AssistantItem;
   defaultExpanded?: boolean;
@@ -538,6 +551,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   expandWhileStreaming?: boolean;
   /** Opt-in for compact mode to keep live DeepSeek reasoning from growing an unbounded DOM. */
   truncateStreamingReasoning?: boolean;
+  creationMode?: boolean;
 }) {
   const t = useT();
   const reasoningBodyRef = useRef<HTMLDivElement>(null);
@@ -605,7 +619,7 @@ export const AssistantMessage = memo(function AssistantMessage({
             aria-expanded={reasoningOpen}
           >
             <ProcessBrainIcon size={12} />
-            <span>{t("msg.thinking")}</span>
+            <span data-creation-label={t("creation.reasoningLabel")}>{t("msg.thinking")}</span>
             <span className="reasoning__meta">{item.streaming && !item.reasoningComplete ? t("msg.thinkingRunning") : t("msg.thinkingDone")}</span>
             <ChevronRight className={`reasoning__chevron${reasoningOpen ? " reasoning__chevron--open" : ""}`} size={12} />
           </button>
@@ -616,7 +630,7 @@ export const AssistantMessage = memo(function AssistantMessage({
       )}
       {hasText && (
         <div className="msg__body">
-          <Markdown text={item.text} />
+          <Markdown text={item.text} plainStatusBlocks={creationMode} />
         </div>
       )}
     </div>
